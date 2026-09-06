@@ -40,7 +40,7 @@ test('register/login/logout use hashed passwords and revocable HttpOnly sessions
   assert.equal((await request('/api/state')).status, 401);
   const registered = await request('/api/auth/register', { method: 'POST', body: credentials(' Owner@Example.Test ') });
   assert.equal(registered.status, 201);
-  assert.deepEqual(Object.keys(registered.body.user).sort(), ['email', 'id', 'name']);
+  assert.deepEqual(Object.keys(registered.body.user).sort(), ['email', 'emailVerified', 'id', 'name']);
   assert.equal(registered.body.user.email, 'owner@example.test');
   assert.match(registered.headers.get('set-cookie'), /HttpOnly; SameSite=Lax; Path=\//);
   assert.doesNotMatch(registered.headers.get('set-cookie'), /Secure/);
@@ -122,6 +122,43 @@ test('enforces payload size and credential attempt limits', async (t) => {
   const limited = await request('/api/auth/login', { method: 'POST', body: {} });
   assert.equal(limited.status, 429);
   assert.equal(limited.headers.get('retry-after'), '900');
+});
+
+test('keeps independent authentication limits for clients behind explicitly trusted proxies', async (t) => {
+  const { request } = await start(t, { trustedProxies: '::ffff:127.0.0.1,192.0.2.10' });
+  const login = (client) => request('/api/auth/login', { method: 'POST', body: {}, headers: { 'X-Forwarded-For': `${client}, 192.0.2.10` } });
+  for (let index = 0; index < 20; index++) assert.equal((await login('198.51.100.1')).status, 400);
+  assert.equal((await login('198.51.100.1')).status, 429);
+  for (let index = 0; index < 20; index++) assert.equal((await login('198.51.100.2')).status, 400);
+  assert.equal((await login('198.51.100.2')).status, 429);
+});
+
+test('does not accept rotating spoofed client IPs from an untrusted peer', async (t) => {
+  const { request } = await start(t, { trustedProxies: '192.0.2.10' });
+  for (let index = 0; index < 20; index++) {
+    assert.equal((await request('/api/auth/login', { method: 'POST', body: {}, headers: { 'X-Forwarded-For': `198.51.100.${index + 1}` } })).status, 400);
+  }
+  assert.equal((await request('/api/auth/login', { method: 'POST', body: {}, headers: { 'X-Forwarded-For': '203.0.113.99' } })).status, 429);
+});
+
+test('rejects malformed trusted forwarding chains and cannot bypass the closest untrusted hop', async (t) => {
+  const { request } = await start(t, { trustedProxies: '127.0.0.1' });
+  const malformed = await request('/api/auth/login', { method: 'POST', body: credentials(), headers: { 'X-Forwarded-For': '198.51.100.1, unknown' } });
+  assert.equal(malformed.status, 400);
+  assert.match(malformed.body.error, /전달 IP 헤더/);
+  for (let index = 0; index < 20; index++) {
+    const forwarded = `203.0.113.${index + 1}, 198.51.100.1`;
+    assert.equal((await request('/api/auth/login', { method: 'POST', body: {}, headers: { 'X-Forwarded-For': forwarded } })).status, 400);
+  }
+  assert.equal((await request('/api/auth/login', { method: 'POST', body: {}, headers: { 'X-Forwarded-For': '203.0.113.99, 198.51.100.1' } })).status, 429);
+});
+
+test('retains the global four-password-work limit across distinct forwarded clients', async (t) => {
+  const { request } = await start(t, { trustedProxies: '127.0.0.1' });
+  const responses = await Promise.all(Array.from({ length: 5 }, (_, index) => request('/api/auth/login', {
+    method: 'POST', body: credentials(`concurrent-${index}@example.test`), headers: { 'X-Forwarded-For': `198.51.100.${index + 1}` },
+  })));
+  assert.deepEqual(responses.map((response) => response.status).sort(), [401, 401, 401, 401, 429]);
 });
 
 test('sets Secure cookies for an HTTPS origin and gates integration handlers', async (t) => {

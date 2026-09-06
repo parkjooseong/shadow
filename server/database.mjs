@@ -42,7 +42,38 @@ export function createDatabase({ dbPath = process.env.SHADOW_DB_PATH || resolve(
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       session_id TEXT NOT NULL, encrypted_value TEXT NOT NULL, expires_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS account_tokens (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      purpose TEXT NOT NULL CHECK (purpose IN ('password-reset', 'email-verification')),
+      expires_at INTEGER NOT NULL, UNIQUE (user_id, purpose)
+    );
+    CREATE TABLE IF NOT EXISTS integration_automations (
+      user_id TEXT NOT NULL, provider TEXT NOT NULL, record TEXT NOT NULL,
+      PRIMARY KEY (user_id, provider),
+      FOREIGN KEY (user_id, provider) REFERENCES connections(user_id, provider) ON DELETE CASCADE
+    );
   `);
+  // Additive migration keeps pre-verification accounts and their calendars intact.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (!db.prepare('PRAGMA table_info(users)').all().some((column) => column.name === 'email_verified_at')) db.exec('ALTER TABLE users ADD COLUMN email_verified_at TEXT');
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); db.close(); throw error; }
+
+  const transaction = (operation) => {
+    db.exec('BEGIN IMMEDIATE');
+    try { const result = operation(); db.exec('COMMIT'); return result; }
+    catch (error) { db.exec('ROLLBACK'); throw error; }
+  };
+  const revokeAccess = (userId) => {
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM oauth_states WHERE user_id = ?').run(userId);
+    db.prepare('DELETE FROM account_tokens WHERE user_id = ?').run(userId);
+  };
+  const consumeAccountToken = (token, purpose) => {
+    if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
+    return db.prepare('DELETE FROM account_tokens WHERE id = ? AND purpose = ? AND expires_at > ? RETURNING user_id').get(hash(token), purpose, Date.now());
+  };
 
   const encrypt = (value, aad) => {
     if (!key) throw new Error('External connections require SHADOW_ENCRYPTION_KEY.');
@@ -69,30 +100,78 @@ export function createDatabase({ dbPath = process.env.SHADOW_DB_PATH || resolve(
     encryptionAvailable: !!key,
     close: () => db.close(),
     createUser({ email, name, passwordHash }) {
-      const user = { id: randomUUID(), email, name };
+      const user = { id: randomUUID(), email, name, emailVerified: false };
       db.prepare('INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)').run(user.id, email, name, passwordHash, new Date().toISOString());
       return user;
     },
     getUserByEmail(email) {
-      const row = db.prepare('SELECT id, email, name, password_hash FROM users WHERE email = ?').get(email);
-      return row ? { id: row.id, email: row.email, name: row.name, passwordHash: row.password_hash } : null;
+      const row = db.prepare('SELECT id, email, name, password_hash, email_verified_at FROM users WHERE email = ?').get(email);
+      return row ? { id: row.id, email: row.email, name: row.name, emailVerified: !!row.email_verified_at, passwordHash: row.password_hash } : null;
     },
-    createSession(userId, expiresAt) {
-      const token = randomBytes(32).toString('base64url');
-      db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
-      db.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)').run(hash(token), userId, expiresAt);
-      return token;
+    createSession(userId, expiresAt, expectedPasswordHash) {
+      return transaction(() => {
+        if (expectedPasswordHash && db.prepare('SELECT password_hash FROM users WHERE id = ?').get(userId)?.password_hash !== expectedPasswordHash) return null;
+        const token = randomBytes(32).toString('base64url');
+        db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
+        db.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)').run(hash(token), userId, expiresAt);
+        return token;
+      });
     },
     getSession(token) {
       if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
-      const row = db.prepare('SELECT users.id, users.email, users.name, sessions.id AS session_id FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.id = ? AND sessions.expires_at > ?').get(hash(token), Date.now());
-      return row ? { id: row.id, email: row.email, name: row.name, sessionId: row.session_id } : null;
+      const row = db.prepare('SELECT users.id, users.email, users.name, users.email_verified_at, sessions.id AS session_id FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.id = ? AND sessions.expires_at > ?').get(hash(token), Date.now());
+      return row ? { id: row.id, email: row.email, name: row.name, emailVerified: !!row.email_verified_at, sessionId: row.session_id } : null;
     },
     deleteSession(token) {
       if (typeof token !== 'string') return;
       const id = hash(token);
       db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
       db.prepare('DELETE FROM oauth_states WHERE session_id = ?').run(id);
+    },
+    revokeOtherSessions(userId, currentSessionId) {
+      return transaction(() => {
+        db.prepare('DELETE FROM oauth_states WHERE user_id = ? AND session_id <> ?').run(userId, currentSessionId);
+        return db.prepare('DELETE FROM sessions WHERE user_id = ? AND id <> ?').run(userId, currentSessionId).changes;
+      });
+    },
+    createAccountToken(userId, purpose, expiresAt) {
+      if (!['password-reset', 'email-verification'].includes(purpose) || !Number.isSafeInteger(expiresAt)) throw new Error('Invalid account token.');
+      const token = randomBytes(32).toString('base64url');
+      transaction(() => {
+        db.prepare('DELETE FROM account_tokens WHERE expires_at <= ?').run(Date.now());
+        db.prepare('DELETE FROM account_tokens WHERE user_id = ? AND purpose = ?').run(userId, purpose);
+        db.prepare('INSERT INTO account_tokens (id, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)').run(hash(token), userId, purpose, expiresAt);
+      });
+      return token;
+    },
+    deleteAccountToken(token) {
+      return db.prepare('DELETE FROM account_tokens WHERE id = ?').run(hash(token)).changes > 0;
+    },
+    verifyEmail(token) {
+      return transaction(() => {
+        const row = consumeAccountToken(token, 'email-verification');
+        if (!row) return false;
+        db.prepare('UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?').run(new Date().toISOString(), row.user_id);
+        return true;
+      });
+    },
+    resetPassword(token, passwordHash) {
+      return transaction(() => {
+        const row = consumeAccountToken(token, 'password-reset');
+        if (!row) return null;
+        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, row.user_id);
+        revokeAccess(row.user_id);
+        return db.prepare('SELECT id, email, name FROM users WHERE id = ?').get(row.user_id);
+      });
+    },
+    changePassword(userId, sessionId, expectedPasswordHash, passwordHash) {
+      return transaction(() => {
+        if (!db.prepare('SELECT id FROM sessions WHERE id = ? AND user_id = ? AND expires_at > ?').get(sessionId, userId, Date.now())) return false;
+        const result = db.prepare('UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?').run(passwordHash, userId, expectedPasswordHash);
+        if (!result.changes) return false;
+        revokeAccess(userId);
+        return true;
+      });
     },
     getState(userId) {
       const row = db.prepare('SELECT state, revision FROM calendars WHERE user_id = ?').get(userId);
@@ -150,6 +229,21 @@ export function createDatabase({ dbPath = process.env.SHADOW_DB_PATH || resolve(
     },
     deleteConnection(userId, provider) {
       return db.prepare('DELETE FROM connections WHERE user_id = ? AND provider = ?').run(userId, provider).changes > 0;
+    },
+    getAutomation(userId, provider) {
+      const row = db.prepare('SELECT record FROM integration_automations WHERE user_id = ? AND provider = ?').get(userId, provider);
+      return row ? JSON.parse(row.record) : null;
+    },
+    saveAutomation(userId, provider, record) {
+      if (!record || typeof record.enabled !== 'boolean' || ![5, 15, 60].includes(record.intervalMinutes) || !['idle', 'scheduled', 'running', 'backoff', 'paused'].includes(record.status) || !['nextRunAt', 'lastRunAt'].every((field) => record[field] === null || Number.isSafeInteger(record[field]) && record[field] >= 0) || !Number.isSafeInteger(record.failureCount) || record.failureCount < 0 || !(record.lastError === null || typeof record.lastError === 'string' && record.lastError.length <= 500)) throw new Error('Invalid integration automation.');
+      const { enabled, intervalMinutes, status, nextRunAt, lastRunAt, lastError, failureCount } = record;
+      db.prepare('INSERT INTO integration_automations (user_id, provider, record) VALUES (?, ?, ?) ON CONFLICT(user_id, provider) DO UPDATE SET record = excluded.record').run(userId, provider, JSON.stringify({ enabled, intervalMinutes, status, nextRunAt, lastRunAt, lastError, failureCount }));
+    },
+    listDueAutomations(nowMs) {
+      return db.prepare('SELECT user_id, provider, record FROM integration_automations').all().map((row) => ({ ...JSON.parse(row.record), userId: row.user_id, provider: row.provider })).filter((record) => record.enabled && ['scheduled', 'backoff'].includes(record.status) && record.nextRunAt !== null && record.nextRunAt <= nowMs);
+    },
+    listEnabledAutomations() {
+      return db.prepare('SELECT user_id, provider, record FROM integration_automations').all().map((row) => ({ ...JSON.parse(row.record), userId: row.user_id, provider: row.provider })).filter((record) => record.enabled);
     },
     saveOAuthState(value) {
       const { state, userId, sessionId, expiresAt } = value;

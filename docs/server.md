@@ -23,6 +23,8 @@ The API listens on `127.0.0.1:8787`; the expected browser origin is `http://loca
 | `SHADOW_PUBLIC_URL` | Provider-specific default | Public origin used by OAuth callbacks; set equal to `SHADOW_ORIGIN` |
 | `SHADOW_DB_PATH` | `data/shadow.sqlite` | Persistent SQLite file; parent directory created if absent |
 | `SHADOW_ENCRYPTION_KEY` | None | Base64-encoded 32-byte key for external credentials and OAuth state |
+| `SHADOW_TRUSTED_PROXIES` | Empty (trust none) | Comma-separated exact IP addresses of controlled reverse proxies; no hostnames, ports, scopes, or CIDRs |
+| `SHADOW_MAIL_MODE` | `disabled` | Optional `smtp` or explicit development-only `outbox`; see [mail.md](./mail.md) for SMTP variables |
 
 For a single-server build, run `npm run build`, then run the server with the origin where users actually access it. A non-local production origin must use HTTPS. Terminate TLS at a trusted reverse proxy and keep the database directory on persistent private storage. Set `HOST=0.0.0.0` only when the hosting environment requires it. Static-only hosting does not provide the API or account functionality. No deployment is created automatically.
 
@@ -52,26 +54,32 @@ All APIs return JSON. Errors use `{ "error": "message" }`. Mutations require an 
 | `DELETE /api/shares/:id` | Owner session | `{ok:true}` |
 | `GET /api/public/:token` | No session needed | `{title,state:AppState}` |
 
-Email addresses are normalized to lowercase. Names must contain 1–50 characters and passwords 10–128 characters. Passwords are salted and hashed with scrypt (`N=32768`, `r=8`, `p=1`); raw passwords are not persisted. Session cookies are HttpOnly, SameSite=Lax, valid for seven days, and Secure when the configured origin is HTTPS. Only token hashes are stored for sessions. Login rotates the current session; logout revokes it immediately. There is no password recovery or email verification flow in this release.
+Email addresses are normalized to lowercase. Names must contain 1–50 characters and passwords 10–128 characters. Passwords are salted and hashed with scrypt (`N=32768`, `r=8`, `p=1`); raw passwords are not persisted. Session cookies are HttpOnly, SameSite=Lax, valid for seven days, and Secure when the configured origin is HTTPS. Only token hashes are stored for sessions. Login rotates the current session; logout revokes it immediately. User responses also include `emailVerified`. Password recovery, email verification, password changes and other-session revocation are implemented in [account-security.md](./account-security.md).
 
 State writes validate the same domain schema as the browser and use an atomic SQLite transaction for optimistic concurrency. A client must load the current revision before replacing server state, and must explicitly handle `409` rather than silently retrying an overwrite. User IDs are derived exclusively from sessions, never request bodies.
 
+The optional `X-Shadow-Account` header binds a request to the account displayed by the client; an authenticated mismatch returns `409` without touching either account. Opt-in [browser and provider automatic synchronization](./auto-sync.md) retains these guards. The server starts/stops the provider scheduler with the HTTP service and waits for active jobs and bounded mail sends before closing SQLite.
+
 Sharing publishes an immutable snapshot of the supplied state, including event titles, locations, shadows, and costs. The UI must obtain explicit consent before creating a link. Anyone possessing the random bearer link can read that snapshot; there is no public write API. Later calendar edits do not modify a share. Revoking a link stops subsequent API reads but cannot erase copies a recipient has already saved. Listing and revoking shares are owner-only; each account may keep up to 100 links.
 
-Request bodies are capped at 2 MB. Authentication is limited to 20 requests per IP per 15 minutes and four simultaneous password calculations. The server does not trust forwarded IP headers. A reverse proxy should provide its own connection/rate controls if publicly deployed, because users behind one proxy can share the server-side IP limit. The limiter is process-local; run one API process for this SQLite-backed MVP. No request bodies, passwords, sessions, or provider tokens are logged.
+Request bodies are capped at 2 MB. Authentication is limited to 20 requests per client IP per 15 minutes and four simultaneous password calculations across all clients. By default the client is the direct socket peer, and forwarded headers are ignored. Without an explicit proxy configuration, users behind the same proxy share this IP limit. The limiter is process-local; run one API process for this SQLite-backed MVP. No request bodies, passwords, sessions, or provider tokens are logged.
+
+If a controlled reverse proxy fronts the API, explicitly list its exact IP in `SHADOW_TRUSTED_PROXIES`. For example, `127.0.0.1` is appropriate only if the proxy reaches Node from that loopback address and all processes with access to that socket are trusted. Configure every trusted hop to overwrite untrusted `X-Forwarded-For` input or append the actual peer address correctly, and restrict direct access to the Node port. Never trust an arbitrary client, shared client NAT, hostname, or whole network. Keep the proxy's own connection and rate controls enabled.
+
+Only a trusted immediate peer enables `X-Forwarded-For`. The server walks its bare IP addresses from right to left across explicitly trusted hops and uses the first untrusted address; client-supplied values farther left cannot override it. IPv6 spellings and IPv4-mapped IPv6 addresses are normalized before comparison. A missing header falls back to the socket peer. A malformed trusted header returns `400` before password work; the full chain is limited to 16 addresses and 1,024 bytes. Untrusted peers' headers remain ignored, even if malformed. `Forwarded` and `X-Real-IP` are not used. Configuration accepts at most 64 exact IPv4/IPv6 addresses; invalid entries fail startup instead of silently widening trust. This option does not configure a proxy or modify any deployment automatically.
 
 ## Provider integration store
 
-`createApp({dbPath,origin,encryptionKey,integrationFactory,distPath})` returns `{server,database,close}`. `integrationFactory({store,origin})` returns an object with `route({method,path,url,body,userId,sessionId})`, which resolves to `{status,body}` or `{status,redirect}`. These routes execute only after authentication and mutation Origin checks.
+`createApp({dbPath,origin,trustedProxies,encryptionKey,integrationFactory,distPath})` returns `{server,database,close}`. `trustedProxies` defaults to `SHADOW_TRUSTED_PROXIES` and accepts the same comma-separated IP list. `integrationFactory({store,origin})` returns an object with `route({method,path,url,body,userId,sessionId})`, which resolves to `{status,body}` or `{status,redirect}`. These routes execute only after authentication and mutation Origin checks.
 
 The database exposes synchronous `getState`/`saveState` (compare-and-swap revision), user-scoped `getConnection`/`saveConnection`/`deleteConnection`, metadata-only `listConnections`, and `saveOAuthState`/`consumeOAuthState`. Connection JSON and temporary OAuth state are encrypted with AES-256-GCM and bound to the owning user/provider or OAuth identifier using authenticated additional data. OAuth state is consumed once and bound to the originating session.
 
 ## Verification
 
 ```bash
-node --test server/app.test.mjs
+node --test server/client-ip.test.mjs server/app.test.mjs
 ```
 
-Tests exercise real ephemeral HTTP servers and SQLite databases: account/session lifecycle, CSRF rejection, schema validation, account isolation, concurrent revision conflicts, immutable shares, owner-only revocation, body/rate limits, Secure cookies, encrypted credential persistence, and session-bound single-use OAuth state. Node 24 currently emits an experimental SQLite warning; it is not suppressed. Provider HTTP contract tests are separate and do not establish real provider account authorization.
+Tests exercise real ephemeral HTTP servers and SQLite databases: account/session lifecycle, CSRF rejection, schema validation, account isolation, concurrent revision conflicts, immutable shares, owner-only revocation, body/rate limits, independent clients behind trusted proxies, ignored spoofed headers, malformed forwarding chains, the shared four-password-work limit, Secure cookies, encrypted credential persistence, and session-bound single-use OAuth state. Node 24 currently emits an experimental SQLite warning; it is not suppressed. Provider HTTP contract tests are separate and do not establish real provider account authorization.
 
 The SQLite and cryptography APIs follow the [Node.js SQLite documentation](https://nodejs.org/api/sqlite.html) and [Node.js 24 cryptography documentation](https://nodejs.org/docs/latest-v24.x/api/crypto.html).

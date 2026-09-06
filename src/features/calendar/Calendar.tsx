@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import { useApp } from '../../app/AppContext';
-import { addDays, dateToDayNumber, detectConflicts, formatDateLabel, formatMinutes, formatTime, segmentLabels, toAbsoluteMinute } from '../../domain/calendar';
+import { addDays, dateToDayNumber, formatDateLabel, formatMinutes, formatTime, segmentLabels, toAbsoluteMinute } from '../../domain/calendar';
+import { previewEventConflicts } from '../../domain/conflictPreview';
+import { expandEvents } from '../../domain/recurrence';
 import type { CalendarEvent, EventType } from '../../domain/types';
-import { DAY_MINUTES, eventForeground, HOUR_HEIGHT, layoutDay, MIN_EVENT_HEIGHT, MINUTE_HEIGHT, snapStartMinute, visibleConflicts } from './layout';
+import { DAY_MINUTES, eventForeground, HOUR_HEIGHT, layoutDay, MIN_EVENT_HEIGHT, MINUTE_HEIGHT, snapStartMinute, summarizeVisibleConflicts } from './layout';
 
 interface CalendarProps {
   days: string[];
   events: CalendarEvent[];
+  /** Unfiltered stored events, including recurrence masters outside the current view. */
+  conflictEvents?: CalendarEvent[];
   readOnly?: boolean;
   eventTypes: EventType[];
   onSelect: (event: CalendarEvent) => void;
@@ -30,7 +34,7 @@ function todayInKorea() {
   return `${value('year')}-${value('month')}-${value('day')}`;
 }
 
-export function Calendar({ days, events, eventTypes, readOnly = false, onSelect, onCreate }: CalendarProps) {
+export function Calendar({ days, events, conflictEvents = events, eventTypes, readOnly = false, onSelect, onCreate }: CalendarProps) {
   const { dispatch } = useApp();
   const gridRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -39,9 +43,23 @@ export function Calendar({ days, events, eventTypes, readOnly = false, onSelect,
   const suppressClickRef = useRef(false);
   const [preview, setPreview] = useState<CalendarEvent | null>(null);
   const eventsWithPreview = useMemo(() => events.map((event) => preview?.id === event.id ? preview : event), [events, preview]);
-  const allConflicts = useMemo(() => visibleConflicts(eventsWithPreview, days), [days, eventsWithPreview]);
-  const conflictIds = new Set(allConflicts.flatMap((conflict) => [conflict.eventId, conflict.otherEventId]));
-  const dragConflicts = preview ? detectConflicts(preview, eventsWithPreview) : [];
+  const conflictCalculation = useMemo(() => {
+    try {
+      return { events: expandEvents(conflictEvents, days[0], days.at(-1)!), error: '' };
+    } catch (cause) {
+      return { events: [], error: cause instanceof Error ? cause.message : '충돌을 계산하지 못했습니다.' };
+    }
+  }, [days, conflictEvents]);
+  const previewId = preview?.id;
+  const conflictSummary = useMemo(() => summarizeVisibleConflicts(conflictCalculation.events.filter((event) => event.id !== previewId), days), [conflictCalculation.events, days, previewId]);
+  const conflictIds = new Set(conflictSummary.conflictIds);
+  const dragPreview = useMemo(() => preview ? previewEventConflicts(preview, conflictEvents) : undefined, [preview, conflictEvents]);
+  if (preview) {
+    for (const conflict of dragPreview?.conflicts ?? []) {
+      conflictIds.add(conflict.eventId);
+      conflictIds.add(conflict.otherEventId);
+    }
+  }
   const today = todayInKorea();
 
   useEffect(() => {
@@ -133,7 +151,7 @@ export function Calendar({ days, events, eventTypes, readOnly = false, onSelect,
     </div>
     <div className="calendar-drag-region">
       <div className={`drag-status${preview ? ' is-active' : ''}`} role="status" aria-live="polite" aria-atomic="true">
-        {preview ? `${formatTime(preview.startMinute)} — ${formatTime(preview.endMinute)} · ${dragConflicts.length ? `그림자가 ${formatMinutes(dragConflicts.reduce((total, conflict) => total + conflict.overlapMinutes, 0))} 겹칩니다. 저장은 가능합니다.` : '그림자가 함께 이동 중입니다.'} Escape 키로 취소` : ''}
+        {preview ? `${formatTime(preview.startMinute)} — ${formatTime(preview.endMinute)} · ${dragPreview?.error ? `충돌 확인을 완료하지 못했습니다: ${dragPreview.error}` : dragPreview?.conflicts.length ? `그림자가 ${dragPreview.truncated ? '최소 ' : ''}${formatMinutes(dragPreview.conflicts.reduce((total, conflict) => total + conflict.overlapMinutes, 0))} 겹칩니다. 숨긴 일정도 확인합니다. 저장은 가능합니다.` : '그림자가 함께 이동 중입니다. 숨긴 일정도 확인합니다.'} Escape 키로 취소` : ''}
       </div>
       <div ref={scrollRef} className="calendar-scroll" tabIndex={0} aria-label="시간표 · 위아래로 스크롤하여 0시부터 24시까지 확인">
         <div ref={gridRef} className="calendar-grid" style={{ gridTemplateColumns: `64px repeat(${days.length}, minmax(0, 1fr))` }}>
@@ -178,6 +196,7 @@ export function Calendar({ days, events, eventTypes, readOnly = false, onSelect,
         {!events.length && <div className="empty-calendar"><div><span className="empty-orbit" aria-hidden="true">◌</span><h3>표시할 일정이 없습니다.</h3><p>선택한 날짜와 검색 조건을 확인해 주세요.</p>{!readOnly && <button className="button primary" onClick={() => onCreate(days[0])}>첫 일정 만들기</button>}</div></div>}
       </div>
     </div>
-    {allConflicts.length > 0 && !preview && <div className="conflict-summary" role="status"><strong>겹치는 실제 시간이 있습니다.</strong><span>현재 화면에서 일정 쌍 기준 {formatMinutes(allConflicts.reduce((total, conflict) => total + conflict.overlapMinutes, 0))}이 겹칩니다. 일정은 그대로 유지됩니다.</span></div>}
+    {conflictSummary.overlapMinutes > 0 && !preview && <div className="conflict-summary" role="status"><strong>겹치는 실제 시간이 있습니다.</strong><span>선택한 날짜에서 일정 쌍 기준 {formatMinutes(conflictSummary.overlapMinutes)}이 겹칩니다. 검색·유형 필터로 숨긴 일정도 포함합니다. 일정은 그대로 유지됩니다.</span></div>}
+    {conflictCalculation.error && <p className="form-error" role="status">충돌 확인을 완료하지 못했습니다: {conflictCalculation.error}</p>}
   </>;
 }

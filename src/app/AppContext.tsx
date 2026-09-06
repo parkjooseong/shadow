@@ -1,7 +1,8 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { AppState, CalendarEvent, EventType } from '../domain/types';
 import { getEventTypeValidationError, getEventValidationError, isAppState } from '../domain/validation';
-import { createInitialState, loadState, resetStoredState, saveState } from '../services/storage';
+import { commitStoredState, createInitialState, loadState, STORAGE_CONFLICT_MESSAGE, STORAGE_KEY, STORAGE_LOCK_MESSAGE, supportsStorageLock } from '../services/storage';
+import { CLOUD_SYNC_KEY, CLOUD_SYNC_SETTINGS_EVENT } from '../services/cloudSync';
 
 type Action =
   | { type: 'event/save'; event: CalendarEvent }
@@ -9,7 +10,7 @@ type Action =
   | { type: 'type/save'; eventType: EventType }
   | { type: 'type/delete'; id: string }
   | { type: 'data/reset' }
-  | { type: 'state/replace'; state: AppState };
+  | { type: 'state/replace'; state: AppState; expectedState?: AppState };
 
 function getActionError(state: AppState, action: Action): string | undefined {
   if (action.type === 'state/replace') return isAppState(action.state) ? undefined : '가져올 캘린더 데이터가 올바르지 않습니다.';
@@ -63,13 +64,15 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'data/reset':
       return createInitialState();
     case 'state/replace':
+      if (action.expectedState && state !== action.expectedState) return state;
       return action.state;
   }
 }
 
 interface History { present: AppState; past: AppState[]; future: AppState[] }
-type HistoryAction = Action | { type: 'history/undo' } | { type: 'history/redo' };
+type HistoryAction = Action | { type: 'history/undo' } | { type: 'history/redo' } | { type: 'history/reload'; state: AppState };
 function historyReducer(history: History, action: HistoryAction): History {
+  if (action.type === 'history/reload') return { present: action.state, past: [], future: [] };
   if (action.type === 'history/undo') {
     const previous = history.past.at(-1);
     return previous ? { present: previous, past: history.past.slice(0, -1), future: [history.present, ...history.future] } : history;
@@ -88,8 +91,13 @@ interface AppContextValue {
   dispatch: (action: Exclude<Action, { type: 'data/reset' }>) => boolean;
   storageError?: string;
   storageBlocked: boolean;
+  storageConflict: boolean;
+  storageSupported: boolean;
+  storagePending: boolean;
+  subscribeStorageSaved: (listener: (snapshot: string) => void) => () => void;
   clearStorageError: () => void;
-  resetData: () => boolean;
+  resetData: () => Promise<boolean>;
+  reloadData: () => boolean;
   retrySave: () => void;
   undo: () => void;
   redo: () => void;
@@ -106,50 +114,151 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [storageError, setStorageError] = useState(loaded.error);
   const [actionError, setActionError] = useState<string>();
   const [storageBlocked, setStorageBlocked] = useState(loaded.blocked);
+  const [storageConflict, setStorageConflict] = useState(false);
+  const [storagePending, setStoragePending] = useState(false);
+  const storageSupported = supportsStorageLock();
+  const snapshot = useRef(loaded.snapshot);
+  const savedMemory = useRef(loaded.state);
+  const savedListeners = useRef(new Set<(snapshot: string) => void>());
+  const blocked = useRef(loaded.blocked || !storageSupported);
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const generation = useRef(0);
+  const mounted = useRef(false);
+  const currentState = useRef(state);
+  currentState.current = state;
+
+  const recordFailure = useCallback((result: { status: 'conflict' | 'unsupported' | 'error'; error: string }) => {
+    setStorageError(result.error);
+    if (result.status !== 'error') {
+      blocked.current = true;
+      setStorageBlocked(true);
+      setStorageConflict(result.status === 'conflict');
+    }
+  }, []);
+
+  const persist = useCallback((next: AppState) => {
+    const version = ++generation.current;
+    setStoragePending(true);
+    queue.current = queue.current.then(async () => {
+      if (!mounted.current || blocked.current || version !== generation.current) return;
+      const result = await commitStoredState(next, snapshot.current, () => mounted.current && !blocked.current && version === generation.current);
+      if (result.status === 'cancelled') return;
+      if (result.status === 'saved') {
+        snapshot.current = result.snapshot; savedMemory.current = next;
+        for (const listener of savedListeners.current) listener(result.snapshot);
+      }
+      if (!mounted.current || version !== generation.current) return;
+      if (result.status === 'saved') setStorageError(undefined);
+      else recordFailure(result);
+    }).finally(() => { if (mounted.current && version === generation.current) setStoragePending(false); });
+  }, [recordFailure]);
 
   useEffect(() => {
-    if (storageBlocked) return;
-    const error = saveState(state);
-    setStorageError(error);
-  }, [state, storageBlocked]);
+    mounted.current = true;
+    const checkExternal = () => {
+      try {
+        const latest = window.localStorage.getItem(STORAGE_KEY);
+        if (latest === snapshot.current) return;
+        if (latest === JSON.stringify(currentState.current)) { snapshot.current = latest; savedMemory.current = currentState.current; return; }
+        recordFailure({ status: 'conflict', error: STORAGE_CONFLICT_MESSAGE });
+      } catch { recordFailure({ status: 'conflict', error: '저장소 변경을 확인하지 못해 저장을 중지했습니다. 이 탭을 백업한 뒤 최신 데이터를 다시 불러와 주세요.' }); }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === STORAGE_KEY || event.key === null) checkExternal();
+    };
+    const warnUnsaved = (event: BeforeUnloadEvent) => {
+      if (JSON.stringify(currentState.current) !== JSON.stringify(savedMemory.current)) {
+        event.preventDefault();
+        event.returnValue = '';
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('focus', checkExternal);
+    window.addEventListener('beforeunload', warnUnsaved);
+    return () => { mounted.current = false; window.removeEventListener('storage', onStorage); window.removeEventListener('focus', checkExternal); window.removeEventListener('beforeunload', warnUnsaved); };
+  }, [recordFailure]);
+
+  useEffect(() => {
+    if (!blocked.current && storageSupported) persist(state);
+  }, [state, persist, storageSupported]);
 
   const dispatch = useCallback<AppContextValue['dispatch']>((action) => {
-    if (storageBlocked) return false;
+    if (blocked.current) return false;
     const error = getActionError(state, action);
     setActionError(error);
     if (error) return false;
     rawDispatch(action);
     return true;
-  }, [state, storageBlocked]);
+  }, [state]);
 
   const value = useMemo<AppContextValue>(() => ({
     state,
     dispatch,
-    storageError: actionError ?? storageError,
-    storageBlocked,
-    canUndo: !storageBlocked && history.past.length > 0,
-    canRedo: !storageBlocked && history.future.length > 0,
-    undo: () => { if (!storageBlocked) rawDispatch({ type: 'history/undo' }); },
-    redo: () => { if (!storageBlocked) rawDispatch({ type: 'history/redo' }); },
+    storageError: actionError ?? (!storageSupported ? STORAGE_LOCK_MESSAGE : storageError),
+    storageBlocked: storageBlocked || !storageSupported,
+    storageConflict,
+    storageSupported,
+    storagePending,
+    subscribeStorageSaved: (listener) => { savedListeners.current.add(listener); return () => { savedListeners.current.delete(listener); }; },
+    canUndo: !storageBlocked && storageSupported && history.past.length > 0,
+    canRedo: !storageBlocked && storageSupported && history.future.length > 0,
+    undo: () => { if (!blocked.current) rawDispatch({ type: 'history/undo' }); },
+    redo: () => { if (!blocked.current) rawDispatch({ type: 'history/redo' }); },
     clearStorageError: () => {
       setActionError(undefined);
     },
     retrySave: () => {
-      if (!storageBlocked) setStorageError(saveState(state));
+      if (!blocked.current) persist(state);
     },
-    resetData: () => {
-      const error = resetStoredState();
-      if (error) {
-        setStorageError(error);
-        return false;
-      }
-      rawDispatch({ type: 'data/reset' });
+    resetData: async () => {
+      if (!storageSupported || storageConflict) return false;
+      const version = ++generation.current;
+      const next = createInitialState();
+      let success = false;
       setActionError(undefined);
-      setStorageError(undefined);
-      setStorageBlocked(false);
+      setStoragePending(true);
+      queue.current = queue.current.then(async () => {
+        if (!mounted.current || version !== generation.current) return;
+        try {
+          // Match cloud synchronization's lock order and wait for its active request.
+          await navigator.locks.request(CLOUD_SYNC_KEY, { mode: 'exclusive' }, async () => {
+            if (!mounted.current || version !== generation.current) return;
+            // Local-only reset must never become an automatic server-wide deletion.
+            // Removing corrupt settings is safe here because reset was explicitly confirmed.
+            window.localStorage.removeItem(CLOUD_SYNC_KEY);
+            window.dispatchEvent(new Event(CLOUD_SYNC_SETTINGS_EVENT));
+            const result = await commitStoredState(next, snapshot.current, () => mounted.current && version === generation.current);
+            if (result.status === 'cancelled') return;
+            if (result.status !== 'saved') { if (mounted.current) recordFailure(result.status === 'error' ? { ...result, error: `초기화하지 못했습니다. ${result.error}` } : result); return; }
+            snapshot.current = result.snapshot;
+            savedMemory.current = next;
+            blocked.current = false;
+            success = true;
+            if (!mounted.current) return;
+            rawDispatch({ type: 'history/reload', state: next });
+            setActionError(undefined); setStorageError(undefined); setStorageBlocked(false); setStorageConflict(false);
+          });
+        } catch {
+          if (mounted.current && version === generation.current) recordFailure({ status: 'error', error: '자동 동기화를 안전하게 끄지 못해 초기화하지 않았습니다. 기존 일정은 유지됩니다. 브라우저 저장소와 잠금 권한을 확인한 뒤 다시 시도해 주세요.' });
+        }
+      }).finally(() => { if (mounted.current && version === generation.current) setStoragePending(false); });
+      await queue.current;
+      return success;
+    },
+    reloadData: () => {
+      ++generation.current;
+      setStoragePending(false);
+      const latest = loadState();
+      snapshot.current = latest.snapshot;
+      blocked.current = latest.blocked || !storageSupported;
+      setStorageBlocked(latest.blocked); setStorageConflict(false); setActionError(undefined); setStorageError(latest.error);
+      // Preserve the current tab's in-memory data if the external value is corrupt.
+      if (latest.blocked) return false;
+      savedMemory.current = latest.state;
+      rawDispatch({ type: 'history/reload', state: latest.state });
       return true;
     },
-  }), [state, dispatch, actionError, storageError, storageBlocked, history.past.length, history.future.length]);
+  }), [state, dispatch, actionError, storageError, storageBlocked, storageConflict, storageSupported, storagePending, persist, recordFailure, history.past.length, history.future.length]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

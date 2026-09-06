@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { addDays, defaultsFromType, detectConflicts, formatDateLabel, formatMinutes, segmentLabels, startOfWeek, summarizeEvent } from '../domain/calendar';
-import type { AppState, CalendarEvent, Conflict, EventType } from '../domain/types';
+import { addDays, dayNumberToDate, defaultsFromType, formatDateLabel, formatMinutes, formatTime, segmentLabels, startOfWeek, summarizeEvent } from '../domain/calendar';
+import type { AppState, CalendarEvent, EventType } from '../domain/types';
+import { previewEventConflicts, type PreviewConflict } from '../domain/conflictPreview';
 import { useApp } from './AppContext';
 import { Calendar } from '../features/calendar/Calendar';
 import { SidePanel } from './SidePanel';
@@ -13,6 +14,9 @@ import { NotificationSettings } from '../features/calendar/NotificationSettings'
 import { AccountPanel } from '../features/account/AccountPanel';
 import { api } from '../services/api';
 import { createInitialState } from '../services/storage';
+import { StorageNotice } from './StorageNotice';
+import { AccountActionPanel, readAccountAction } from '../features/account/AccountSecurity';
+import { CloudSyncNotice } from '../features/account/CloudSyncProvider';
 
 interface EventDraft {
   id?: string;
@@ -135,13 +139,15 @@ function eventFromDraft(draft: EventDraft, existing?: CalendarEvent): CalendarEv
   };
 }
 
-function getConflictMessage(conflict: Conflict, events: CalendarEvent[]) {
-  const other = events.find((event) => event.id === conflict.otherEventId);
-  return `${other?.title ?? '다른 일정'}의 ${segmentLabels[conflict.otherSegment]}과 ${segmentLabels[conflict.eventSegment]}가 ${formatMinutes(conflict.overlapMinutes)} 겹칩니다.`;
+function getConflictMessage(conflict: PreviewConflict) {
+  const startDate = dayNumberToDate(Math.floor(conflict.start / 1440));
+  const endDate = dayNumberToDate(Math.floor(conflict.end / 1440));
+  const range = `${startDate} ${formatTime(conflict.start)}–${endDate === startDate ? '' : `${endDate} `}${formatTime(conflict.end)}`;
+  return `${conflict.event.date} 회차 · “${conflict.otherEvent.title}”의 ${segmentLabels[conflict.otherSegment]}과 ${segmentLabels[conflict.eventSegment]}가 ${formatMinutes(conflict.overlapMinutes)} 겹칩니다 (${range}).`;
 }
 
 export function App() {
-  const { state: localState, storageError, storageBlocked, retrySave, resetData, undo, redo, canUndo, canRedo } = useApp();
+  const { state: localState, storageError, storageBlocked, storagePending, undo, redo, canUndo, canRedo } = useApp();
   const isNarrow = useIsNarrow();
   const initialDate = todayInKorea();
   const [selectedDate, setSelectedDate] = useState(initialDate);
@@ -149,6 +155,12 @@ export function App() {
   const [showTypes, setShowTypes] = useState(false);
   const [showData, setShowData] = useState(false);
   const [showAccount, setShowAccount] = useState(() => new URLSearchParams(window.location.search).get('integration') === 'connected');
+  const [accountAction, setAccountAction] = useState(readAccountAction);
+  useEffect(() => {
+    const openAction = () => { const action = readAccountAction(); if (action) setAccountAction(action); };
+    window.addEventListener('hashchange', openAction);
+    return () => window.removeEventListener('hashchange', openAction);
+  }, []);
   const [showStats, setShowStats] = useState(false);
   const [view, setView] = useState<'day' | 'week' | 'month'>(isNarrow ? 'day' : 'week');
   const [query, setQuery] = useState('');
@@ -209,12 +221,8 @@ export function App() {
       </header>
 
       {shareToken && <div className="notice warning" role="status">{shared ? `${shared.title} · 읽기 전용 공유본` : shareError || '공유 캘린더를 불러오는 중…'} <a href="/">내 캘린더로 돌아가기</a></div>}
-      {storageError && !readOnly && (
-        <div className="notice warning" role="alert">
-          <span>{storageError}</span>
-          {storageBlocked ? <button className="button danger" onClick={() => { if (window.confirm('보존 중인 저장 데이터를 지우고 초기화할까요? 이 작업은 되돌릴 수 없습니다.')) resetData(); }}>데이터 초기화</button> : <button className="button ghost" onClick={retrySave}>저장 재시도</button>}
-        </div>
-      )}
+      {!readOnly && <StorageNotice onReload={() => { setEventPanel(null); setShowTypes(false); setShowData(false); setShowAccount(false); }} />}
+      {!readOnly && <CloudSyncNotice />}
 
       <section className="intro-row">
         <div>
@@ -245,12 +253,13 @@ export function App() {
             <button className="icon-button" onClick={goNext} aria-label={view === 'month' ? '다음 달' : isNarrow || view === 'day' ? '다음 날짜' : '다음 주'}>→</button>
             <strong>{view === 'month' ? selectedDate.slice(0, 7) : isNarrow || view === 'day' ? formatDateLabel(selectedDate) : `${formatDateLabel(weekDays[0], true)} — ${formatDateLabel(weekDays[6], true)}`}</strong>
           </div>
-          <span className="local-note">{readOnly ? '공유된 복사본' : storageError ? '저장 상태를 확인해 주세요.' : '브라우저에 저장 · 계정 메뉴에서 서버 동기화'}</span>
+          <span className="local-note">{readOnly ? '공유된 복사본' : storageError ? '저장 상태를 확인해 주세요.' : storagePending ? '브라우저에 저장 중…' : '브라우저에 저장 · 계정 메뉴에서 서버 동기화'}</span>
         </div>
         {showStats && <Statistics days={visibleDays} events={filtered} types={state.eventTypes} />}
         {view === 'month' ? <MonthCalendar date={selectedDate} events={filtered} eventTypes={state.eventTypes} readOnly={readOnly} onSelect={selectEvent} onDay={(date) => { setSelectedDate(date); setView('day'); }} /> : <Calendar
           days={visibleDays}
           events={readOnly && !shared ? [] : filtered}
+          conflictEvents={state.events}
           readOnly={readOnly}
           eventTypes={state.eventTypes}
           onSelect={selectEvent}
@@ -266,7 +275,8 @@ export function App() {
       {eventPanel && <EventPanel initialEvent={eventPanel.event} date={eventPanel.date} onSaved={setSelectedDate} onClose={() => setEventPanel(null)} />}
       {showTypes && <EventTypesPanel onClose={() => setShowTypes(false)} />}
       {showData && <DataPanel onClose={() => setShowData(false)} />}
-      {showAccount && <AccountPanel onClose={() => setShowAccount(false)} />}
+      {showAccount && !accountAction && <AccountPanel onClose={() => setShowAccount(false)} />}
+      {accountAction && <AccountActionPanel action={accountAction} onClose={() => { setAccountAction(null); setShowAccount(false); }} />}
       {!readOnly && <NotificationSettings events={state.events} />}
     </main>
   );
@@ -292,16 +302,10 @@ function EventPanel({ initialEvent, date, onSaved, onClose }: { initialEvent?: C
   const [editingEvent, setEditingEvent] = useState(initialEvent);
   const [draft, setDraft] = useState(() => draftFromEvent(initialEvent, state.eventTypes, date));
   const [error, setError] = useState<FormError>();
-  const candidate = eventFromDraft(draft, editingEvent);
+  const candidate = useMemo(() => eventFromDraft(draft, editingEvent), [draft, editingEvent]);
   const validationError = getEventValidationError(candidate, state.eventTypes);
   const summary = validationError ? undefined : summarizeEvent(candidate);
-  let surroundingEvents: CalendarEvent[] = [];
-  let conflictError = '';
-  if (!validationError) {
-    try { surroundingEvents = expandEvents(state.events.filter((event) => event.id !== candidate.id), addDays(candidate.date, -2), addDays(candidate.endDate ?? candidate.date, 2)); }
-    catch (cause) { conflictError = cause instanceof Error ? cause.message : '충돌을 계산하지 못했습니다.'; }
-  }
-  const conflicts = validationError ? [] : detectConflicts(candidate, surroundingEvents);
+  const conflictPreview = useMemo(() => validationError ? undefined : previewEventConflicts(candidate, state.events), [candidate, state.events, validationError]);
   const series = initialEvent?.sourceId ? state.events.find((event) => event.id === initialEvent.sourceId) : undefined;
   const fieldError = (field: string) => ({
     'aria-invalid': error?.field === field || undefined,
@@ -363,8 +367,9 @@ function EventPanel({ initialEvent, date, onSaved, onClose }: { initialEvent?: C
         <NumberField name="mealWon" label="식비" value={draft.mealWon} onChange={(value) => setNumber('mealWon', value)} unit="원" error={error?.field === 'mealWon' ? 'event-form-error' : undefined} />
       </div></fieldset>
       {summary ? <div className="actual-price"><span>이 약속의 실제 가격</span><strong>시간 {formatMinutes(summary.totalMinutes)} <i aria-hidden="true" /> {formatWon(summary.totalCostWon)}</strong><small>일정 {formatMinutes(summary.coreMinutes)} + 그림자 {formatMinutes(summary.shadowMinutes)}</small></div> : <p className="panel-description">제목과 올바른 시간을 입력하면 실제 시간과 비용이 표시됩니다.</p>}
-      {conflicts.length > 0 && <div className="form-conflicts" role="status"><strong>이 일정의 그림자가 겹칩니다.</strong>{conflicts.map((conflict, index) => <span key={index}>{getConflictMessage(conflict, surroundingEvents)}</span>)}</div>}
-      {conflictError && <p className="form-error" role="status">충돌 미리보기: {conflictError} 일정 저장은 가능합니다.</p>}
+      {conflictPreview && !conflictPreview.error && candidate.recurrence && <p className="panel-description">반복 종료일까지 {conflictPreview.occurrenceCount}회차의 충돌을 확인합니다.</p>}
+      {!!conflictPreview?.conflicts.length && <div className="form-conflicts" role="status"><strong>이 일정의 그림자가 겹칩니다.</strong>{conflictPreview.conflicts.map((conflict, index) => <span key={index}>{getConflictMessage(conflict)}</span>)}{conflictPreview.truncated && <span>추가 충돌이 있습니다. 처음 {conflictPreview.conflicts.length}개 구간만 표시합니다. 반복 기간을 줄여 상세 내용을 확인해 주세요.</span>}</div>}
+      {conflictPreview?.error && <p className="form-error" role="status">충돌 미리보기: {conflictPreview.error} 충돌 확인을 완료하지 못했습니다. 일정 저장은 가능합니다.</p>}
       {error && <p id="event-form-error" className="form-error" role="alert">{error.message}</p>}
       <div className="form-actions">{initialEvent && <button type="button" className="button danger" onClick={remove}>삭제</button>}<span /><button type="button" className="button ghost" onClick={onClose}>취소</button><button type="submit" className="button primary">{initialEvent ? '변경 저장' : '일정 만들기'}</button></div>
     </form>
@@ -376,7 +381,7 @@ function NumberField({ name, label, value, onChange, unit, error }: { name: stri
 }
 
 function EventTypesPanel({ onClose }: { onClose: () => void }) {
-  const { state, dispatch, resetData, storageBlocked } = useApp();
+  const { state, dispatch, resetData, storageBlocked, storagePending } = useApp();
   const [editing, setEditing] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState<FormError>();
@@ -432,6 +437,6 @@ function EventTypesPanel({ onClose }: { onClose: () => void }) {
       <div className="form-actions"><span /><button type="button" className="button ghost" onClick={() => setDraft(null)}>취소</button><button className="button primary">저장</button></div>
     </form>}
     {message && <p className="form-message" role="status">{message}</p>}
-    <div className="danger-zone"><strong>이 브라우저의 일정 지우기</strong><p>이 작업은 되돌릴 수 없으며 다른 기기에는 영향을 주지 않습니다.</p><button className="button danger" onClick={() => { if (window.confirm('모든 일정과 사용자 유형을 초기화할까요?') && resetData()) { setDraft(null); setMessage('기본 유형으로 초기화했습니다.'); } else setMessage('초기화하지 않았습니다.'); }}>전체 초기화</button></div>
+    <div className="danger-zone"><strong>이 브라우저의 일정 지우기</strong><p>브라우저 자동 동기화를 끈 뒤 로컬 데이터만 지웁니다. 되돌릴 수 없으며 서버와 다른 기기의 일정은 유지됩니다.</p><button disabled={storagePending} className="button danger" onClick={async () => { if (window.confirm('브라우저 자동 동기화를 끄고 모든 로컬 일정과 사용자 유형을 초기화할까요? 서버의 일정은 유지됩니다.') && await resetData()) { setDraft(null); setMessage('브라우저 자동 동기화를 끄고 기본 유형으로 초기화했습니다.'); } else setMessage('초기화하지 않았습니다.'); }}>전체 초기화</button></div>
   </SidePanel>;
 }

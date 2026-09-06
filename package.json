@@ -10,6 +10,7 @@
     "start": "node --env-file-if-exists=.env server/index.mjs",
     "test:server": "node --test server/*.test.mjs",
     "smoke": "node scripts/smoke.mjs",
+    "backup": "node scripts/backup.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "typecheck": "tsc -b --pretty false",

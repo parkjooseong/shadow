@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createDatabase } from './database.mjs';
 import { createIntegrationService } from './integrations/index.mjs';
 import { createOAuthAdapter } from './integrations/providers.mjs';
@@ -88,12 +92,63 @@ test('OAuth uses PKCE and single-use state bound to the authenticated session', 
 
 test('missing encryption/client configuration remains disconnected with an actionable error', async () => {
   let networkCalls = 0;
-  const service = createIntegrationService({ store: { encryptionAvailable: false }, env: {}, fetchImpl: async () => { networkCalls++; } });
+  const service = createIntegrationService({ store: { encryptionAvailable: false, listConnections: () => [] }, env: {}, fetchImpl: async () => { networkCalls++; } });
   const result = await service.route({ method: 'GET', path: '/api/integrations', userId: 'user', sessionId: 'session' });
   assert.equal(result.status, 200);
   assert.ok(result.body.providers.every((provider) => !provider.connected && !provider.configured));
   assert.equal(networkCalls, 0);
 });
+
+for (const failure of ['corrupted-record', 'changed-key', 'missing-key']) {
+  test(`connection recovery isolates ${failure} and permits explicit removal without touching calendars`, async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), 'shadow-connection-recovery-'));
+    const dbPath = join(directory, 'test.sqlite');
+    const oldKey = Buffer.alloc(32, 7).toString('base64');
+    let store = createDatabase({ dbPath, encryptionKey: oldKey });
+    t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+    const user = store.createUser({ email: 'recovery@example.test', name: 'Recovery test', passwordHash: 'test-only' });
+    const local = appState([event()]);
+    store.saveState(user.id, local, 0);
+    const connection = { credentials: { accessToken: 'sensitive-test-access', refreshToken: 'sensitive-test-refresh', expiresAt: Date.now() + 3600000 }, lastSyncedAt: '2026-09-07T00:00:00.000Z', conflicts: [] };
+    store.saveConnection(user.id, 'google', connection);
+    if (failure === 'corrupted-record') {
+      const raw = new DatabaseSync(dbPath);
+      try { raw.prepare('UPDATE connections SET encrypted_value = ? WHERE user_id = ? AND provider = ?').run('corrupt-private-test-value', user.id, 'google'); }
+      finally { raw.close(); }
+    } else {
+      store.close();
+      store = createDatabase({ dbPath, encryptionKey: failure === 'missing-key' ? '' : Buffer.alloc(32, 8).toString('base64') });
+    }
+    if (failure !== 'missing-key') store.saveConnection(user.id, 'microsoft', connection);
+    let networkCalls = 0;
+    const service = createIntegrationService({ store, env: ENV, fetchImpl: async () => { networkCalls++; assert.fail('Recovery must not call a provider'); } });
+    const request = (method, path) => service.route({ method, path, userId: user.id, sessionId: 'recovery-session' });
+    const response = await request('GET', '/api/integrations');
+    assert.equal(response.status, 200);
+    const google = response.body.providers.find((provider) => provider.id === 'google');
+    assert.equal(google.connected, true); assert.equal(google.recoveryRequired, true);
+    assert.equal(google.lastSyncedAt, null); assert.deepEqual(google.conflicts, []);
+    assert.ok(google.recoveryMessage.includes('기존 일정은 유지'));
+    assert.ok(!JSON.stringify(response).includes('sensitive-test'));
+    assert.ok(!JSON.stringify(response).includes('corrupt-private-test-value'));
+    assert.ok(!JSON.stringify(response).includes('decrypted'));
+    if (failure !== 'missing-key') {
+      const microsoft = response.body.providers.find((provider) => provider.id === 'microsoft');
+      assert.equal(microsoft.connected, true); assert.equal(microsoft.recoveryRequired, false);
+      assert.equal(microsoft.lastSyncedAt, connection.lastSyncedAt);
+      assert.equal((await request('POST', '/api/integrations/google/connect')).body.code, 'connection_recovery_required');
+    }
+    assert.throws(() => store.getConnection(user.id, 'google'), 'Listing does not erase the unreadable record');
+    assert.deepEqual(store.getState(user.id).state, local);
+    const unconfigured = createIntegrationService({ store, env: { SHADOW_PUBLIC_URL: 'invalid-public-origin' }, fetchImpl: async () => { networkCalls++; } });
+    const removed = await unconfigured.route({ method: 'DELETE', path: '/api/integrations/google', userId: user.id, sessionId: 'recovery-session' });
+    assert.equal(removed.status, 200); assert.equal(removed.body.disconnected, true);
+    assert.equal(store.getConnection(user.id, 'google'), null);
+    assert.deepEqual(store.getState(user.id).state, local);
+    if (failure !== 'missing-key') assert.deepEqual(store.getConnection(user.id, 'microsoft'), connection);
+    assert.equal(networkCalls, 0);
+  });
+}
 
 test('expired OAuth state and attacker-selected callback origins are rejected', async (t) => {
   const ctx = setup(t, async () => assert.fail('No network call expected'));

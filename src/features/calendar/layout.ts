@@ -1,5 +1,5 @@
-import { detectConflicts, getFootprint, toAbsoluteMinute } from '../../domain/calendar';
-import type { CalendarEvent, Conflict, FootprintSegment } from '../../domain/types';
+import { getFootprint, toAbsoluteMinute } from '../../domain/calendar';
+import type { CalendarEvent, FootprintSegment } from '../../domain/types';
 
 export const HOUR_HEIGHT = 68;
 export const MINUTE_HEIGHT = HOUR_HEIGHT / 60;
@@ -54,18 +54,45 @@ export function layoutDay(events: CalendarEvent[], date: string): DayPlacement[]
   return intervals;
 }
 
-/** Count each event pair once, and only the overlap inside the dates on screen. */
-export function visibleConflicts(events: CalendarEvent[], days: string[]): Conflict[] {
-  const windows = days.map((date) => toAbsoluteMinute(date, 0));
-  return events.flatMap((event, index) => detectConflicts(event, events.slice(index + 1)).flatMap((conflict) => {
-    const other = events.find((item) => item.id === conflict.otherEventId)!;
-    const segment = getFootprint(event).find((item) => item.kind === conflict.eventSegment)!;
-    const otherSegment = getFootprint(other).find((item) => item.kind === conflict.otherSegment)!;
-    const start = Math.max(segment.start, otherSegment.start);
-    const end = Math.min(segment.end, otherSegment.end);
-    const overlapMinutes = windows.reduce((total, dayStart) => total + Math.max(0, Math.min(end, dayStart + DAY_MINUTES) - Math.max(start, dayStart)), 0);
-    return overlapMinutes > 0 ? [{ ...conflict, overlapMinutes }] : [];
-  }));
+export interface VisibleConflictSummary {
+  overlapMinutes: number;
+  conflictIds: Set<string>;
+}
+
+/** Sum every visible event-pair overlap without materializing a quadratic pair list. */
+export function summarizeVisibleConflicts(events: CalendarEvent[], days: string[]): VisibleConflictSummary {
+  const windows = [...new Set(days)].map((date) => toAbsoluteMinute(date, 0));
+  const boundaries: { minute: number; opening: boolean; eventId: string }[] = [];
+  for (const event of events) {
+    for (const segment of getFootprint(event)) {
+      for (const dayStart of windows) {
+        const start = Math.max(segment.start, dayStart);
+        const end = Math.min(segment.end, dayStart + DAY_MINUTES);
+        if (end <= start) continue;
+        boundaries.push({ minute: start, opening: true, eventId: event.id }, { minute: end, opening: false, eventId: event.id });
+      }
+    }
+  }
+  // Closing before opening excludes adjacent segments and adjacent events.
+  boundaries.sort((a, b) => a.minute - b.minute || Number(a.opening) - Number(b.opening));
+  const active = new Set<string>();
+  const conflictIds = new Set<string>();
+  let previousMinute = boundaries[0]?.minute ?? 0;
+  let overlapMinutes = 0;
+  for (const boundary of boundaries) {
+    const pairCount = active.size * (active.size - 1) / 2;
+    overlapMinutes += (boundary.minute - previousMinute) * pairCount;
+    previousMinute = boundary.minute;
+    if (!boundary.opening) {
+      active.delete(boundary.eventId);
+      continue;
+    }
+    // When there are already two active events, both were marked on opening.
+    if (active.size === 1) conflictIds.add(active.values().next().value!);
+    if (active.size > 0) conflictIds.add(boundary.eventId);
+    active.add(boundary.eventId);
+  }
+  return { overlapMinutes, conflictIds };
 }
 
 export function snapStartMinute(rawMinute: number, duration: number): number {

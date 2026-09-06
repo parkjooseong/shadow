@@ -23,6 +23,7 @@ export interface LoadResult {
   state: AppState;
   error?: string;
   blocked: boolean;
+  snapshot: string | null;
 }
 
 export function loadState(): LoadResult {
@@ -30,15 +31,15 @@ export function loadState(): LoadResult {
   try {
     raw = window.localStorage.getItem(STORAGE_KEY);
   } catch {
-    return { state: createInitialState(), blocked: true, error: '브라우저 저장소를 읽지 못했습니다. 저장된 데이터 보호를 위해 변경을 중지했습니다. 브라우저 설정을 확인한 뒤 새로고침해 주세요.' };
+    return { state: createInitialState(), snapshot: null, blocked: true, error: '브라우저 저장소를 읽지 못했습니다. 저장된 데이터 보호를 위해 변경을 중지했습니다. 브라우저 설정을 확인한 뒤 새로고침해 주세요.' };
   }
-  if (raw === null) return { state: createInitialState(), blocked: false };
+  if (raw === null) return { state: createInitialState(), snapshot: null, blocked: false };
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (!isAppState(parsed)) return { state: createInitialState(), blocked: true, error: '저장된 데이터 형식 또는 버전을 읽을 수 없습니다. 기존 데이터는 보존되어 있으며, 전체 초기화 전에는 변경할 수 없습니다.' };
-    return { state: parsed, blocked: false };
+    if (!isAppState(parsed)) return { state: createInitialState(), snapshot: raw, blocked: true, error: '저장된 데이터 형식 또는 버전을 읽을 수 없습니다. 기존 데이터는 보존되어 있으며, 전체 초기화 전에는 변경할 수 없습니다.' };
+    return { state: parsed, snapshot: raw, blocked: false };
   } catch {
-    return { state: createInitialState(), blocked: true, error: '저장된 데이터가 손상되어 읽을 수 없습니다. 기존 데이터는 보존되어 있으며, 전체 초기화 전에는 변경할 수 없습니다.' };
+    return { state: createInitialState(), snapshot: raw, blocked: true, error: '저장된 데이터가 손상되어 읽을 수 없습니다. 기존 데이터는 보존되어 있으며, 전체 초기화 전에는 변경할 수 없습니다.' };
   }
 }
 
@@ -58,5 +59,37 @@ export function resetStoredState(): string | undefined {
     return undefined;
   } catch {
     return '브라우저 저장소를 초기화하지 못했습니다. 기존 데이터는 유지됩니다. 브라우저 설정을 확인해 주세요.';
+  }
+}
+
+export type CommitResult =
+  | { status: 'saved'; snapshot: string }
+  | { status: 'cancelled' }
+  | { status: 'conflict' | 'unsupported' | 'error'; error: string };
+
+export function supportsStorageLock(): boolean {
+  return typeof navigator.locks?.request === 'function';
+}
+
+export const STORAGE_CONFLICT_MESSAGE = '다른 탭에서 저장 데이터가 변경되어 이 탭의 저장을 중지했습니다. 이 탭의 변경사항은 화면에 남아 있습니다. 백업한 뒤 최신 데이터를 불러와 주세요.';
+export const STORAGE_LOCK_MESSAGE = '이 브라우저 환경은 안전한 동시 저장을 지원하지 않아 읽기 전용입니다. HTTPS 또는 localhost에서 지원 브라우저로 열어 주세요.';
+
+/** Serialize cooperating tabs and compare the exact snapshot read before editing. */
+export async function commitStoredState(state: AppState, expectedSnapshot: string | null, isCurrent: () => boolean = () => true): Promise<CommitResult> {
+  if (!isAppState(state)) return { status: 'error', error: '올바르지 않은 일정 데이터는 저장할 수 없습니다.' };
+  if (!supportsStorageLock()) return { status: 'unsupported', error: STORAGE_LOCK_MESSAGE };
+  try {
+    return await navigator.locks.request(STORAGE_KEY, { mode: 'exclusive' }, () => {
+      if (!isCurrent()) return { status: 'cancelled' } as const;
+      const current = window.localStorage.getItem(STORAGE_KEY);
+      const snapshot = JSON.stringify(state);
+      if (current === snapshot) return { status: 'saved', snapshot } as const;
+      if (current !== expectedSnapshot) return { status: 'conflict', error: STORAGE_CONFLICT_MESSAGE } as const;
+      // No await between comparison and write: every SHADOW tab holds this same lock.
+      const error = saveState(state);
+      return error ? { status: 'error', error } as const : { status: 'saved', snapshot } as const;
+    });
+  } catch {
+    return { status: 'error', error: '브라우저 저장 잠금 또는 데이터에 접근하지 못했습니다. 변경사항을 이 브라우저에 저장하지 못했습니다. 백업 후 저장을 재시도해 주세요.' };
   }
 }

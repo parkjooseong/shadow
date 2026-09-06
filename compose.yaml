@@ -1,0 +1,32 @@
+services:
+  shadow:
+    build:
+      context: .
+    image: shadow-calendar:local
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "8787"
+      SHADOW_DB_PATH: /app/data/shadow.sqlite
+      SHADOW_ORIGIN: ${SHADOW_ORIGIN:?Set the exact public HTTPS origin in the private .env file}
+      SHADOW_PUBLIC_URL: ${SHADOW_ORIGIN:?Set the exact public HTTPS origin in the private .env file}
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - shadow-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    stop_grace_period: 30s
+
+volumes:
+  shadow-data:

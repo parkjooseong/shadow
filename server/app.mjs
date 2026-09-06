@@ -1,9 +1,11 @@
 import { createServer } from 'node:http';
-import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { createDatabase } from './database.mjs';
+import { createClientIpResolver } from './client-ip.mjs';
+import { createMailer, isMailAddress } from './mail.mjs';
 import { isAppState } from '../src/domain/validation.ts';
 
 const deriveKey = promisify(scrypt);
@@ -19,7 +21,7 @@ function httpError(status, message) {
 }
 
 function userView(user) {
-  return user ? { id: user.id, email: user.email, name: user.name } : null;
+  return user ? { id: user.id, email: user.email, name: user.name, emailVerified: !!user.emailVerified } : null;
 }
 
 function sessionToken(req) {
@@ -60,13 +62,24 @@ function readJson(req) {
   });
 }
 
-function validateCredentials(body, register) {
-  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+function validateEmail(value) {
+  const email = typeof value === 'string' ? value.trim().toLowerCase() : '';
   if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw httpError(400, '올바른 이메일을 입력해 주세요.');
-  if (typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) throw httpError(400, '비밀번호는 10~128자로 입력해 주세요.');
+  return email;
+}
+
+function validatePassword(value) {
+  if (typeof value !== 'string' || value.length < 10 || value.length > 128) throw httpError(400, '비밀번호는 10~128자로 입력해 주세요.');
+  return value;
+}
+
+function validateCredentials(body, register) {
+  const email = validateEmail(body.email);
+  if (register && !isMailAddress(email)) throw httpError(400, '메일을 받을 수 있는 영문 이메일 주소를 입력해 주세요. 따옴표, 연속된 점, 64자를 넘는 계정명은 사용할 수 없습니다.');
+  const password = validatePassword(body.password);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   if (register && (!name || name.length > 50)) throw httpError(400, '이름은 1~50자로 입력해 주세요.');
-  return { email, password: body.password, name };
+  return { email, password, name };
 }
 
 async function hashPassword(password) {
@@ -82,18 +95,21 @@ async function checkPassword(password, stored) {
   return expectedKey.length === key.length && timingSafeEqual(expectedKey, key) && !!stored;
 }
 
-export function createApp({ dbPath, origin = process.env.SHADOW_ORIGIN || process.env.SHADOW_PUBLIC_URL || 'http://localhost:5173', encryptionKey, integrationFactory, integrationHandler, distPath = resolve('dist') } = {}) {
+export function createApp({ dbPath, origin = process.env.SHADOW_ORIGIN || process.env.SHADOW_PUBLIC_URL || 'http://localhost:5173', trustedProxies = process.env.SHADOW_TRUSTED_PROXIES || '', encryptionKey, integrationFactory, integrationHandler, mailer = createMailer(), distPath = resolve('dist') } = {}) {
   const configured = new URL(origin);
   if (!['http:', 'https:'].includes(configured.protocol) || configured.username || configured.password || configured.origin !== origin) throw new Error('SHADOW_ORIGIN must be an http(s) origin without a path.');
   if (process.env.NODE_ENV === 'production' && configured.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(configured.hostname)) throw new Error('Production authentication requires an HTTPS origin.');
   const secure = configured.protocol === 'https:';
+  const clientIp = createClientIpResolver(trustedProxies);
   const database = createDatabase({ dbPath, encryptionKey });
   const integrations = integrationFactory?.({ store: database, origin });
   const authAttempts = new Map();
+  const mailAttempts = new Map();
+  const pendingMail = new Set();
   let activePasswordChecks = 0;
 
   const rateLimit = (req) => {
-    const key = req.socket.remoteAddress ?? 'unknown';
+    const key = clientIp(req);
     const now = Date.now();
     for (const [address, entry] of authAttempts) if (entry.expires <= now) authAttempts.delete(address);
     const entry = authAttempts.get(key) ?? { count: 0, expires: now + 15 * 60_000 };
@@ -103,11 +119,47 @@ export function createApp({ dbPath, origin = process.env.SHADOW_ORIGIN || proces
     if (activePasswordChecks >= 4) throw httpError(429, '인증 요청을 처리 중입니다. 잠시 후 다시 시도해 주세요.');
   };
 
-  const setSession = (req, res, userId) => {
+  const setSession = (req, res, userId, expectedPasswordHash) => {
     database.deleteSession(sessionToken(req));
-    const token = database.createSession(userId, Date.now() + SESSION_SECONDS * 1000);
+    const token = database.createSession(userId, Date.now() + SESSION_SECONDS * 1000, expectedPasswordHash);
+    if (!token) throw httpError(401, '비밀번호가 변경되었습니다. 다시 로그인해 주세요.');
     res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_SECONDS}${secure ? '; Secure' : ''}`);
   };
+  const clearSession = (res) => res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure ? '; Secure' : ''}`);
+  const enqueueMail = (operation) => {
+    if (!mailer.available || pendingMail.size >= 100) return false;
+    // Resolve the HTTP request before looking up the address or contacting SMTP.
+    const job = new Promise((resolveJob) => setImmediate(resolveJob)).then(operation).catch(() => undefined);
+    pendingMail.add(job);
+    void job.finally(() => pendingMail.delete(job));
+    return true;
+  };
+  const reserveMailRequest = (email, purpose) => {
+    const now = Date.now();
+    for (const [key, entry] of mailAttempts) if (entry.expires <= now) mailAttempts.delete(key);
+    const key = createHash('sha256').update(`${purpose}:${email}`).digest('hex');
+    const entry = mailAttempts.get(key) ?? { count: 0, expires: now + 60 * 60_000 };
+    if (entry.count >= 3 || mailAttempts.size >= 10_000 && !mailAttempts.has(key)) return false;
+    entry.count++;
+    mailAttempts.set(key, entry);
+    return true;
+  };
+  const requestAccountMail = (email, purpose) => {
+    if (!mailer.available) throw httpError(503, '서버에 메일 발송이 설정되지 않아 이메일 확인과 비밀번호 복구를 사용할 수 없습니다.');
+    if (pendingMail.size >= 100) throw httpError(429, '메일 요청을 처리 중입니다. 잠시 후 다시 시도해 주세요.');
+    if (!reserveMailRequest(email, purpose)) return;
+    enqueueMail(async () => {
+      const account = database.getUserByEmail(email);
+      if (!account || purpose === 'email-verification' && account.emailVerified) return;
+      const reset = purpose === 'password-reset';
+      const token = database.createAccountToken(account.id, purpose, Date.now() + (reset ? 30 * 60_000 : 24 * 60 * 60_000));
+      const link = `${origin}/#${new URLSearchParams({ 'account-action': reset ? 'reset-password' : 'verify-email', token })}`;
+      try {
+        await mailer.send({ to: account.email, subject: reset ? '[SHADOW] 비밀번호 재설정' : '[SHADOW] 이메일 주소 확인', text: `${reset ? '비밀번호를 재설정하려면' : '이메일 주소를 확인하려면'} 아래 링크를 열고 화면에서 확인해 주세요.\n\n${link}\n\n이 링크는 ${reset ? '30분' : '24시간'} 동안 한 번만 사용할 수 있습니다. 직접 요청하지 않았다면 무시해 주세요.` });
+      } catch { database.deleteAccountToken(token); }
+    });
+  };
+  const notifyPasswordChange = (email) => enqueueMail(() => mailer.send({ to: email, subject: '[SHADOW] 비밀번호 변경 알림', text: 'SHADOW 계정 비밀번호가 변경되어 모든 기기의 로그인 세션이 종료되었습니다. 본인이 변경하지 않았다면 즉시 비밀번호 재설정을 요청해 주세요. 이 메일에는 비밀번호가 포함되어 있지 않습니다.' }));
 
   async function serveStatic(req, res, pathname) {
     if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: '허용되지 않는 요청입니다.' });
@@ -151,6 +203,32 @@ export function createApp({ dbPath, origin = process.env.SHADOW_ORIGIN || proces
       if (req.headers.origin && req.headers.origin !== origin) throw httpError(403, '허용되지 않은 요청 출처입니다.');
       if (!['GET', 'HEAD'].includes(req.method) && req.headers.origin !== origin) throw httpError(403, '요청 출처를 확인할 수 없습니다.');
       if (path === '/api/health' && req.method === 'GET') return json(res, 200, { status: 'ok', version: 1 });
+      if (path === '/api/auth/capabilities' && req.method === 'GET') return json(res, 200, { mail: { available: !!mailer.available, mode: mailer.mode }, passwordReset: { available: !!mailer.available }, emailVerification: { available: !!mailer.available } });
+      if (path === '/api/auth/password-reset/request' && req.method === 'POST') {
+        rateLimit(req);
+        const email = validateEmail((await readJson(req)).email);
+        requestAccountMail(email, 'password-reset');
+        return json(res, 202, { ok: true, message: '해당 이메일의 계정이 있다면 재설정 안내를 보냅니다. 메일을 받지 못했다면 스팸함을 확인하고 잠시 후 다시 요청해 주세요.' });
+      }
+      if (path === '/api/auth/password-reset/confirm' && req.method === 'POST') {
+        rateLimit(req);
+        const body = await readJson(req);
+        const password = validatePassword(body.password);
+        if (activePasswordChecks >= 4) throw httpError(429, '인증 요청을 처리 중입니다. 잠시 후 다시 시도해 주세요.');
+        activePasswordChecks++;
+        try {
+          const account = database.resetPassword(body.token, await hashPassword(password));
+          if (!account) throw httpError(400, '재설정 링크가 올바르지 않거나 만료되었습니다. 다시 요청해 주세요.');
+          clearSession(res);
+          notifyPasswordChange(account.email);
+          return json(res, 200, { ok: true, reauthenticate: true });
+        } finally { activePasswordChecks--; }
+      }
+      if (path === '/api/auth/email-verification/confirm' && req.method === 'POST') {
+        rateLimit(req);
+        if (!database.verifyEmail((await readJson(req)).token)) throw httpError(400, '이메일 확인 링크가 올바르지 않거나 만료되었습니다. 다시 요청해 주세요.');
+        return json(res, 200, { ok: true });
+      }
       const publicMatch = path.match(/^\/api\/public\/([A-Za-z0-9_-]+)$/);
       if (publicMatch && req.method === 'GET') {
         const share = database.getPublicShare(publicMatch[1]);
@@ -173,19 +251,52 @@ export function createApp({ dbPath, origin = process.env.SHADOW_ORIGIN || proces
             user = database.getUserByEmail(credentials.email);
             if (!await checkPassword(credentials.password, user?.passwordHash)) throw httpError(401, '이메일 또는 비밀번호를 확인해 주세요.');
           }
-          setSession(req, res, user.id);
+          setSession(req, res, user.id, user.passwordHash);
           return json(res, register ? 201 : 200, { user: userView(user) });
         } finally {
           activePasswordChecks--;
         }
       }
       const user = database.getSession(sessionToken(req));
+      const expectedAccount = req.headers['x-shadow-account'];
+      if (expectedAccount !== undefined) {
+        if (typeof expectedAccount !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(expectedAccount)) throw httpError(400, '계정 확인 헤더가 올바르지 않습니다.');
+        if (user && user.id !== expectedAccount) throw httpError(409, '계정이 변경되었습니다. 다시 로그인 상태를 확인해 주세요.');
+      }
       if (path === '/api/auth/me' && req.method === 'GET') return json(res, 200, { user: userView(user) });
       if (!user) throw httpError(401, '로그인이 필요합니다.');
       if (path === '/api/auth/logout' && req.method === 'POST') {
         database.deleteSession(sessionToken(req));
-        res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure ? '; Secure' : ''}`);
+        clearSession(res);
         return json(res, 200, { ok: true });
+      }
+      if (path === '/api/auth/email-verification/request' && req.method === 'POST') {
+        rateLimit(req);
+        await readJson(req);
+        requestAccountMail(user.email, 'email-verification');
+        return json(res, 202, { ok: true, message: '아직 확인하지 않은 이메일 주소로 확인 링크를 보냅니다.' });
+      }
+      if (path === '/api/auth/password/change' && req.method === 'POST') {
+        rateLimit(req);
+        const body = await readJson(req);
+        const password = validatePassword(body.password);
+        const currentPassword = validatePassword(body.currentPassword);
+        if (activePasswordChecks >= 4) throw httpError(429, '인증 요청을 처리 중입니다. 잠시 후 다시 시도해 주세요.');
+        activePasswordChecks++;
+        try {
+          const account = database.getUserByEmail(user.email);
+          if (!await checkPassword(currentPassword, account?.passwordHash)) throw httpError(401, '현재 비밀번호를 확인해 주세요.');
+          const passwordHash = await hashPassword(password);
+          if (!database.changePassword(user.id, user.sessionId, account.passwordHash, passwordHash)) throw httpError(409, '계정 인증 상태가 변경되었습니다. 다시 로그인해 주세요.');
+          clearSession(res);
+          notifyPasswordChange(user.email);
+          return json(res, 200, { ok: true, reauthenticate: true });
+        } finally { activePasswordChecks--; }
+      }
+      if (path === '/api/auth/sessions/revoke-others' && req.method === 'POST') {
+        rateLimit(req);
+        await readJson(req);
+        return json(res, 200, { ok: true, revokedSessions: database.revokeOtherSessions(user.id, user.sessionId) });
       }
       if (path === '/api/state' && req.method === 'GET') return json(res, 200, database.getState(user.id));
       if (path === '/api/state' && req.method === 'PUT') {
@@ -230,6 +341,10 @@ export function createApp({ dbPath, origin = process.env.SHADOW_ORIGIN || proces
       json(res, error.status ?? 500, { error: error.status ? error.message : '서버가 요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.' });
     }
   });
+  server.on('listening', () => {
+    try { integrations?.start?.(); }
+    catch { console.error('Background calendar synchronization could not start. Check server configuration and restart.'); }
+  });
   let closed = false;
   return {
     server,
@@ -238,6 +353,8 @@ export function createApp({ dbPath, origin = process.env.SHADOW_ORIGIN || proces
       if (closed) return;
       closed = true;
       if (server.listening) await new Promise((resolveClose) => server.close(resolveClose));
+      await integrations?.stop?.();
+      await Promise.all(pendingMail);
       database.close();
     },
   };

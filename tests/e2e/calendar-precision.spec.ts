@@ -9,6 +9,7 @@ async function createAppointment(page: Page, title = '정확한 이동') {
   await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
   const block = page.getByRole('button', { name: new RegExp(title) });
   await block.scrollIntoViewIfNeeded();
+  await expect.poll(() => persistedEvent(page)).toMatchObject({ title });
   return block;
 }
 
@@ -35,7 +36,7 @@ test('a 68px drag from the block center moves exactly one hour, closes no editor
   await page.mouse.up();
   await expect(block).toContainText('16:00 — 17:00');
   await expect(page.getByRole('dialog')).toHaveCount(0);
-  expect(await persistedEvent(page)).toMatchObject({ startMinute: 960, endMinute: 1020 });
+  await expect.poll(() => persistedEvent(page)).toMatchObject({ startMinute: 960, endMinute: 1020 });
   await page.reload();
   await expect(block).toContainText('16:00 — 17:00');
 });
@@ -83,7 +84,8 @@ test('mobile dragging measures the real day column and moves exactly one hour', 
   await page.mouse.down();
   await page.mouse.move(box.x + 16, box.y + 78, { steps: 4 });
   await page.mouse.up();
-  expect(await persistedEvent(page)).toMatchObject({ date: before.date, startMinute: 960, endMinute: 1020 });
+  await expect(block).toContainText('16:00 — 17:00');
+  await expect.poll(() => persistedEvent(page)).toMatchObject({ date: before.date, startMinute: 960, endMinute: 1020 });
   await expect(page.getByRole('dialog')).toHaveCount(0);
 });
 
@@ -100,7 +102,8 @@ test('dragging between measured day columns preserves the grabbed time', async (
   await page.mouse.down();
   await page.mouse.move(target.x + target.width / 2, box.y + 10, { steps: 4 });
   await page.mouse.up();
-  expect(await persistedEvent(page)).toMatchObject({ date: targetDate, startMinute: 900, endMinute: 960 });
+  await expect.poll(() => persistedEvent(page)).toMatchObject({ date: targetDate, startMinute: 900, endMinute: 960 });
+  await expect(page.locator(`[data-calendar-date="${targetDate}"]`).getByRole('button', { name: /정확한 이동/ })).toBeVisible();
   await expect(page.getByRole('dialog')).toHaveCount(0);
 });
 

@@ -24,7 +24,7 @@ describe('storage data validation', () => {
   it('round-trips valid events without changing saved snapshots', () => {
     const state = makeState();
     expect(saveState(state)).toBeUndefined();
-    expect(loadState()).toEqual({ state, blocked: false });
+    expect(loadState()).toEqual({ state, snapshot: JSON.stringify(state), blocked: false });
   });
 
   it.each(['{broken', 'null', '{"schemaVersion":2,"events":[],"eventTypes":[]}'])('preserves unreadable data: %s', (raw) => {

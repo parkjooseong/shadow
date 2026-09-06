@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CalendarEvent } from '../../domain/types';
-import { eventForeground, layoutDay, snapStartMinute, visibleConflicts } from './layout';
+import { eventForeground, layoutDay, snapStartMinute, summarizeVisibleConflicts } from './layout';
 
 function appointment(id: string, startMinute: number, endMinute: number, overrides: Partial<CalendarEvent> = {}): CalendarEvent {
   return {
@@ -37,14 +37,54 @@ describe('calendar layout', () => {
   });
 
   it('counts a 23-minute overlap once, not once for each event', () => {
-    const conflicts = visibleConflicts([appointment('a', 900, 960), appointment('b', 937, 1000)], ['2026-09-07']);
-    expect(conflicts.reduce((total, conflict) => total + conflict.overlapMinutes, 0)).toBe(23);
+    const summary = summarizeVisibleConflicts([appointment('a', 900, 960), appointment('b', 937, 1000)], ['2026-09-07']);
+    expect(summary).toEqual({ overlapMinutes: 23, conflictIds: new Set(['a', 'b']) });
   });
 
   it('excludes offscreen overlaps and clips midnight overlaps to the visible day', () => {
     const events = [appointment('a', 1380, 1440, { shadow: { preparationMinutes: 0, outboundTravelMinutes: 0, returnTravelMinutes: 60, recoveryMinutes: 0 } }), appointment('b', 1380, 1440, { shadow: { preparationMinutes: 0, outboundTravelMinutes: 0, returnTravelMinutes: 30, recoveryMinutes: 0 } })];
-    expect(visibleConflicts(events, ['2026-09-06'])).toEqual([]);
-    expect(visibleConflicts(events, ['2026-09-08']).reduce((sum, conflict) => sum + conflict.overlapMinutes, 0)).toBe(30);
+    expect(summarizeVisibleConflicts(events, ['2026-09-06'])).toEqual({ overlapMinutes: 0, conflictIds: new Set() });
+    expect(summarizeVisibleConflicts(events, ['2026-09-08'])).toEqual({ overlapMinutes: 30, conflictIds: new Set(['a', 'b']) });
+    expect(summarizeVisibleConflicts(events, ['2026-09-07', '2026-09-08'])).toEqual({ overlapMinutes: 90, conflictIds: new Set(['a', 'b']) });
+  });
+
+  it('excludes adjacent event and shadow boundaries from conflict identities', () => {
+    const events = [
+      appointment('a', 900, 930, { shadow: { preparationMinutes: 0, outboundTravelMinutes: 0, returnTravelMinutes: 15, recoveryMinutes: 15 } }),
+      appointment('b', 990, 1020, { shadow: { preparationMinutes: 15, outboundTravelMinutes: 15, returnTravelMinutes: 0, recoveryMinutes: 0 } }),
+    ];
+    expect(summarizeVisibleConflicts(events, ['2026-09-07'])).toEqual({ overlapMinutes: 0, conflictIds: new Set() });
+  });
+
+  it('counts three simultaneous events by pairs and marks every overlapping event only', () => {
+    const events = [appointment('a', 900, 960), appointment('b', 930, 990), appointment('c', 945, 975), appointment('adjacent', 990, 1020)];
+    expect(summarizeVisibleConflicts(events, ['2026-09-07'])).toEqual({ overlapMinutes: 75, conflictIds: new Set(['a', 'b', 'c']) });
+    expect(summarizeVisibleConflicts([...events].reverse(), ['2026-09-07'])).toEqual(summarizeVisibleConflicts(events, ['2026-09-07']));
+  });
+
+  it('clips multiday events to distinct requested days without filling gaps or counting duplicate days', () => {
+    const events = [
+      appointment('a', 1380, 60, { endDate: '2026-09-10' }),
+      appointment('b', 1410, 30, { endDate: '2026-09-10' }),
+      appointment('offscreen', 900, 960, { date: '2026-09-08' }),
+    ];
+    expect(summarizeVisibleConflicts(events, ['2026-09-09', '2026-09-07', '2026-09-07'])).toEqual({ overlapMinutes: 1470, conflictIds: new Set(['a', 'b']) });
+  });
+
+  it('does not mark the removed drag source or its previously overlapping neighbor', () => {
+    const events = [appointment('moving', 900, 960), appointment('neighbor', 930, 990), appointment('a', 1100, 1160), appointment('b', 1130, 1190)];
+    const stationary = events.filter((event) => event.id !== 'moving');
+    expect(summarizeVisibleConflicts(stationary, ['2026-09-07'])).toEqual({ overlapMinutes: 30, conflictIds: new Set(['a', 'b']) });
+  });
+
+  it('summarizes all 5,000 dense events exactly without dropping conflict identities', () => {
+    const count = 5000;
+    const events = Array.from({ length: count }, (_, index) => appointment(`dense-${index}`, 900, 960, {
+      shadow: { preparationMinutes: 10, outboundTravelMinutes: 10, returnTravelMinutes: 10, recoveryMinutes: 10 },
+    }));
+    const summary = summarizeVisibleConflicts(events, ['2026-09-07']);
+    expect(summary.overlapMinutes).toBe(count * (count - 1) / 2 * 100);
+    expect(summary.conflictIds).toEqual(new Set(events.map((event) => event.id)));
   });
 
   it('snaps minutes and clamps the entire event within its day', () => {

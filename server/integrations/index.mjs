@@ -3,9 +3,11 @@ import { getEventValidationError, isAppState } from '../../src/domain/validation
 import { IntegrationError, fail, fingerprint, remoteToLocal } from './common.mjs';
 import { createOAuthAdapter, exchangeToken, oauthConfig } from './providers.mjs';
 import { createCalDavAdapter } from './caldav.mjs';
+import { AUTO_SYNC_INTERVALS, createAutoSyncScheduler } from '../auto-sync.mjs';
 
 const PROVIDERS = ['google', 'microsoft', 'apple'];
 const publicConflicts = (conflicts = []) => conflicts.map(({ id, eventId, title, reason }) => ({ id, eventId, title, reason }));
+const RECOVERY_MESSAGE = '저장된 연결 정보를 읽을 수 없습니다. 서버의 기존 암호화 키를 복구하거나, 이 연결 정보를 제거한 뒤 다시 연결해 주세요. 기존 일정은 유지됩니다.';
 
 export function createIntegrationService({ store, env = process.env, fetchImpl = fetch, now = Date.now, adapterFactory } = {}) {
   const busyUsers = new Set();
@@ -29,7 +31,9 @@ export function createIntegrationService({ store, env = process.env, fetchImpl =
   const connectionFor = (userId, provider) => {
     const error = configured(provider);
     if (error) fail('integration_not_configured', error, 503);
-    const connection = store.getConnection(userId, provider);
+    let connection;
+    try { connection = store.getConnection(userId, provider); }
+    catch { fail('connection_recovery_required', RECOVERY_MESSAGE, 409); }
     if (!connection) fail('not_connected', '캘린더를 먼저 연결해 주세요.', 409);
     return connection;
   };
@@ -226,20 +230,56 @@ export function createIntegrationService({ store, env = process.env, fetchImpl =
     }
   }
 
+  const automation = createAutoSyncScheduler({ store, now, run: async (userId, provider) => {
+    if (busyUsers.has(userId)) return { deferred: true };
+    busyUsers.add(userId);
+    try {
+      const connection = connectionFor(userId, provider);
+      if (connection.conflicts?.length) fail('automation_conflict', '해결되지 않은 동기화 충돌이 있습니다.', 409);
+      return await sync(userId, provider);
+    } finally { busyUsers.delete(userId); }
+  } });
+
   async function perform({ method, path, url, body = {}, userId, sessionId }) {
     if (!userId || !sessionId) fail('unauthorized', '로그인이 필요합니다.', 401);
-    const parsedUrl = url instanceof URL ? url : new URL(url || path, publicOrigin());
+    const parsedUrl = url instanceof URL ? url : new URL(url || path, 'http://localhost');
     const pathname = path || parsedUrl.pathname;
     if (method === 'GET' && pathname === '/api/integrations') {
+      // Presence metadata is readable even if encryption configuration changed.
+      // A damaged provider must not hide the other connections or remove its own record.
+      const savedProviders = new Set(store.listConnections(userId).map((entry) => entry.provider));
       return { status: 200, body: { providers: PROVIDERS.map((id) => {
-        const configurationError = configured(id);
-        const stored = store.encryptionAvailable ? store.getConnection(userId, id) : null;
-        return { id, configured: !configurationError, configurationError, connected: !!stored, lastSyncedAt: stored?.lastSyncedAt || null, conflicts: publicConflicts(stored?.conflicts), lastError: stored?.lastError || null };
-      }) } };
+        let configurationError;
+        try { configurationError = configured(id); }
+        catch { configurationError = '제공자 앱 설정을 확인해 주세요.'; }
+        const connected = savedProviders.has(id);
+        let stored = null, recoveryRequired = false;
+        if (connected) {
+          try {
+            stored = store.getConnection(userId, id);
+            if (!stored || typeof stored.credentials !== 'object' || !stored.credentials) throw new Error('Unreadable connection');
+          } catch { recoveryRequired = true; stored = null; }
+        }
+        return { id, configured: !configurationError, configurationError, connected, recoveryRequired, recoveryMessage: recoveryRequired ? RECOVERY_MESSAGE : null, lastSyncedAt: stored?.lastSyncedAt || null, conflicts: publicConflicts(stored?.conflicts), lastError: stored?.lastError || null, automation: automation.get(userId, id) };
+      }), scheduler: automation.status() } };
     }
-    const match = pathname.match(/^\/api\/integrations\/(google|microsoft|apple)(?:\/(connect|callback|sync|resolve))?$/);
+    const match = pathname.match(/^\/api\/integrations\/(google|microsoft|apple)(?:\/(connect|callback|sync|resolve|automation))?$/);
     if (!match) return { status: 404, body: { error: '연결 경로를 찾을 수 없습니다.' } };
     const [, provider, operation] = match;
+    if (operation === 'automation') {
+      if (method === 'GET') return { status: 200, body: { automation: automation.get(userId, provider), scheduler: automation.status() } };
+      if (method !== 'PUT') return { status: 405, body: { error: '자동 동기화 설정은 GET 또는 PUT으로 요청해 주세요.' } };
+      if (!body || typeof body !== 'object' || typeof body.enabled !== 'boolean' || !AUTO_SYNC_INTERVALS.includes(body.intervalMinutes)) fail('invalid_automation', '자동 동기화 여부와 5·15·60분 중 실행 간격을 선택해 주세요.');
+      if (!store.listConnections(userId).some((entry) => entry.provider === provider)) fail('not_connected', '캘린더를 먼저 연결해 주세요.', 409);
+      if (body.enabled) {
+        const connection = connectionFor(userId, provider);
+        if (!store.getState(userId).state) fail('missing_calendar', '먼저 내 계정에 캘린더를 저장해 주세요.', 409);
+        if (connection.conflicts?.length) fail('automation_conflict', '충돌을 먼저 해결한 뒤 자동 동기화를 다시 켜 주세요.', 409);
+      }
+      // Disabling remains available during a run or when encrypted credentials need recovery.
+      const value = automation.configure(userId, provider, body);
+      return { status: 200, body: { automation: value, scheduler: automation.status() } };
+    }
     if (busyUsers.has(userId)) fail('sync_in_progress', '다른 연결 작업을 처리 중입니다. 잠시 후 다시 시도해 주세요.', 409);
     busyUsers.add(userId);
     try {
@@ -250,6 +290,9 @@ export function createIntegrationService({ store, env = process.env, fetchImpl =
       const configurationError = configured(provider);
       if (configurationError) fail('integration_not_configured', configurationError, 503);
       if (method === 'POST' && operation === 'connect') {
+        if (store.listConnections(userId).some((entry) => entry.provider === provider)) {
+          connectionFor(userId, provider);
+        }
         if (provider === 'apple') {
           if (typeof body.username !== 'string' || !/^[^:\s@]+@[^\s@]+\.[^\s@]+$/.test(body.username) || body.username.length > 254 || typeof body.password !== 'string' || !/^[a-z]{4}(?:-[a-z]{4}){3}$/i.test(body.password.trim())) fail('invalid_credentials', 'Apple 계정 이메일과 앱 전용 암호(xxxx-xxxx-xxxx-xxxx)를 입력해 주세요.');
           const connection = newConnection({ username: body.username.trim(), password: body.password.trim() });
@@ -284,13 +327,20 @@ export function createIntegrationService({ store, env = process.env, fetchImpl =
           const connection = connectionFor(userId, provider);
           if (!['local', 'remote'].includes(body.choice) || !connection.conflicts.some((item) => item.id === body.conflictId)) fail('invalid_resolution', '해결할 충돌과 적용할 일정을 선택해 주세요.');
         }
-        return { status: 200, body: await sync(userId, provider, operation === 'resolve' ? body : undefined) };
+        let result;
+        try { result = await sync(userId, provider, operation === 'resolve' ? body : undefined); }
+        catch (error) { automation.record(userId, provider, { error, manual: true }); throw error; }
+        automation.record(userId, provider, { result, manual: true });
+        return { status: 200, body: result };
       }
       return { status: 405, body: { error: '허용되지 않는 연결 작업입니다.' } };
     } finally { busyUsers.delete(userId); }
   }
 
   return {
+    start: automation.start,
+    stop: automation.stop,
+    tick: automation.tick,
     async route(input) {
       try { return await perform(input); } catch (error) {
         return { status: error instanceof IntegrationError ? error.status : 502, body: { error: error instanceof IntegrationError ? error.message : '캘린더 연결 작업을 완료하지 못했습니다.', code: error instanceof IntegrationError ? error.code : 'integration_failed' } };
