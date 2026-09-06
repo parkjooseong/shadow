@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import { useApp } from '../../app/AppContext';
-import { detectConflicts, formatDateLabel, formatMinutes, formatTime, segmentLabels, toAbsoluteMinute } from '../../domain/calendar';
+import { addDays, dateToDayNumber, detectConflicts, formatDateLabel, formatMinutes, formatTime, segmentLabels, toAbsoluteMinute } from '../../domain/calendar';
 import type { CalendarEvent, EventType } from '../../domain/types';
 import { DAY_MINUTES, eventForeground, HOUR_HEIGHT, layoutDay, MIN_EVENT_HEIGHT, MINUTE_HEIGHT, snapStartMinute, visibleConflicts } from './layout';
 
 interface CalendarProps {
   days: string[];
   events: CalendarEvent[];
+  readOnly?: boolean;
   eventTypes: EventType[];
   onSelect: (event: CalendarEvent) => void;
   onCreate: (date: string) => void;
@@ -19,6 +20,7 @@ interface DragSession {
   startX: number;
   startY: number;
   grabOffset: number;
+  grabbedDate: string;
   active: boolean;
 }
 
@@ -28,7 +30,7 @@ function todayInKorea() {
   return `${value('year')}-${value('month')}-${value('day')}`;
 }
 
-export function Calendar({ days, events, eventTypes, onSelect, onCreate }: CalendarProps) {
+export function Calendar({ days, events, eventTypes, readOnly = false, onSelect, onCreate }: CalendarProps) {
   const { dispatch } = useApp();
   const gridRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -58,10 +60,14 @@ export function Calendar({ days, events, eventTypes, onSelect, onCreate }: Calen
       const columns = [...grid.querySelectorAll<HTMLElement>('[data-calendar-date]')];
       const column = columns.find((item) => pointer.clientX < item.getBoundingClientRect().right) ?? columns.at(-1);
       if (!column) return null;
+      if (session.event.allDay || (session.event.endDate && session.event.endDate !== session.event.date)) {
+        const dayDelta = dateToDayNumber(column.dataset.calendarDate!) - dateToDayNumber(session.grabbedDate);
+        return { ...session.event, date: addDays(session.event.date, dayDelta), endDate: session.event.endDate ? addDays(session.event.endDate, dayDelta) : undefined };
+      }
       const rawMinute = (pointer.clientY - grid.getBoundingClientRect().top - session.grabOffset) / MINUTE_HEIGHT;
       const duration = session.event.endMinute - session.event.startMinute;
       const startMinute = snapStartMinute(rawMinute, duration);
-      return { ...session.event, date: column.dataset.calendarDate!, startMinute, endMinute: startMinute + duration };
+      return { ...session.event, date: column.dataset.calendarDate!, endDate: undefined, startMinute, endMinute: startMinute + duration };
     };
     const move = (pointer: PointerEvent) => {
       const next = resolvePointer(pointer);
@@ -106,8 +112,8 @@ export function Calendar({ days, events, eventTypes, onSelect, onCreate }: Calen
     };
   }, [dispatch]);
 
-  const begin = (pointer: ReactPointerEvent<HTMLButtonElement>, event: CalendarEvent) => {
-    if (pointer.button !== 0 || !pointer.isPrimary || sessionRef.current || !gridRef.current) return;
+  const begin = (pointer: ReactPointerEvent<HTMLButtonElement>, event: CalendarEvent, date: string) => {
+    if (readOnly || pointer.button !== 0 || !pointer.isPrimary || sessionRef.current || !gridRef.current) return;
     suppressClickRef.current = false;
     sessionRef.current = {
       event,
@@ -115,6 +121,7 @@ export function Calendar({ days, events, eventTypes, onSelect, onCreate }: Calen
       startX: pointer.clientX,
       startY: pointer.clientY,
       grabOffset: pointer.clientY - gridRef.current.getBoundingClientRect().top - event.startMinute * MINUTE_HEIGHT,
+      grabbedDate: date,
       active: false,
     };
   };
@@ -122,7 +129,7 @@ export function Calendar({ days, events, eventTypes, onSelect, onCreate }: Calen
   return <>
     <div className="calendar-week-header" style={{ gridTemplateColumns: `64px repeat(${days.length}, minmax(0, 1fr))` }}>
       <span />
-      {days.map((date) => <button key={date} className={`day-header ${date === today ? 'today' : ''}`} onClick={() => onCreate(date)}><span>{formatDateLabel(date, true)}</span><small>+ 일정</small></button>)}
+      {days.map((date) => <button key={date} disabled={readOnly} className={`day-header ${date === today ? 'today' : ''}`} onClick={() => onCreate(date)}><span>{formatDateLabel(date, true)}</span>{!readOnly && <small>+ 일정</small>}</button>)}
     </div>
     <div className="calendar-drag-region">
       <div className={`drag-status${preview ? ' is-active' : ''}`} role="status" aria-live="polite" aria-atomic="true">
@@ -133,7 +140,7 @@ export function Calendar({ days, events, eventTypes, onSelect, onCreate }: Calen
           <div className="time-rail" aria-hidden="true" style={{ height: DAY_MINUTES * MINUTE_HEIGHT }}>{Array.from({ length: 25 }, (_, hour) => <span key={hour} style={{ top: hour * HOUR_HEIGHT, transform: hour === 0 ? 'none' : hour === 24 ? 'translateY(-100%)' : 'translateY(-50%)' }}>{String(hour).padStart(2, '0')}:00</span>)}</div>
           {days.map((date) => {
             const dayStart = toAbsoluteMinute(date, 0);
-            return <div className="calendar-day" data-calendar-date={date} key={date} style={{ height: DAY_MINUTES * MINUTE_HEIGHT }} onDoubleClick={() => onCreate(date)}>
+            return <div className="calendar-day" data-calendar-date={date} key={date} style={{ height: DAY_MINUTES * MINUTE_HEIGHT }} onDoubleClick={() => { if (!readOnly) onCreate(date); }}>
               {layoutDay(eventsWithPreview, date).flatMap(({ event, segments, lane, laneCount }) => segments.map((segment) => {
                 const type = eventTypes.find((item) => item.id === event.typeId);
                 const top = Math.max(segment.start, dayStart) - dayStart;
@@ -154,21 +161,21 @@ export function Calendar({ days, events, eventTypes, onSelect, onCreate }: Calen
                   key={`${event.id}-event`}
                   className={`event-block ${conflict ? 'has-conflict' : ''} ${preview?.id === event.id ? 'is-dragging' : ''}`}
                   style={style}
-                  onPointerDown={(pointer) => begin(pointer, event)}
+                  onPointerDown={(pointer) => begin(pointer, event, date)}
                   onDoubleClick={(pointer) => pointer.stopPropagation()}
                   onClick={(pointer) => {
                     if (suppressClickRef.current && pointer.detail !== 0) return;
                     onSelect(event);
                   }}
-                  aria-label={`${event.title}, ${formatTime(event.startMinute)}부터 ${formatTime(event.endMinute)}까지.${conflict ? ' 다른 일정과 충돌.' : ''} Enter 키로 편집`}
+                  aria-label={`${event.title}, ${event.allDay ? '종일' : `${formatTime(event.startMinute)}부터 ${formatTime(event.endMinute)}까지`}.${event.endDate ? ` ${event.endDate}까지.` : ''}${conflict ? ' 다른 일정과 충돌.' : ''}${readOnly ? ' 읽기 전용' : ' Enter 키로 편집'}`}
                 >
-                  <strong>{event.title}</strong><span>{formatTime(event.startMinute)} — {formatTime(event.endMinute)}</span>
+                  <strong>{event.title}{event.sourceId ? ' ↻' : ''}</strong><span>{event.allDay ? '종일' : `${formatTime(event.startMinute)} — ${formatTime(event.endMinute)}`}{event.endDate ? ` · ${event.endDate.slice(5)}까지` : ''}</span>
                 </button>;
               }))}
             </div>;
           })}
         </div>
-        {!events.length && <div className="empty-calendar"><div><span className="empty-orbit" aria-hidden="true">◌</span><h3>첫 일정의 그림자를 만들어 보세요.</h3><p>일정 본체 주변의 준비·이동·회복 시간이 함께 보입니다.</p><button className="button primary" onClick={() => onCreate(days[0])}>첫 일정 만들기</button></div></div>}
+        {!events.length && <div className="empty-calendar"><div><span className="empty-orbit" aria-hidden="true">◌</span><h3>표시할 일정이 없습니다.</h3><p>선택한 날짜와 검색 조건을 확인해 주세요.</p>{!readOnly && <button className="button primary" onClick={() => onCreate(days[0])}>첫 일정 만들기</button>}</div></div>}
       </div>
     </div>
     {allConflicts.length > 0 && !preview && <div className="conflict-summary" role="status"><strong>겹치는 실제 시간이 있습니다.</strong><span>현재 화면에서 일정 쌍 기준 {formatMinutes(allConflicts.reduce((total, conflict) => total + conflict.overlapMinutes, 0))}이 겹칩니다. 일정은 그대로 유지됩니다.</span></div>}

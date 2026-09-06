@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { addDays, defaultsFromType, detectConflicts, formatDateLabel, formatMinutes, segmentLabels, startOfWeek, summarizeEvent } from '../domain/calendar';
-import type { CalendarEvent, Conflict, EventType } from '../domain/types';
+import type { AppState, CalendarEvent, Conflict, EventType } from '../domain/types';
 import { useApp } from './AppContext';
 import { Calendar } from '../features/calendar/Calendar';
 import { SidePanel } from './SidePanel';
-import { getEventValidationError, getEventTypeValidationError } from '../domain/validation';
+import { getEventValidationError, getEventTypeValidationError, isAppState } from '../domain/validation';
+import { expandEvents } from '../domain/recurrence';
+import { MonthCalendar, monthDates, shiftMonth } from '../features/calendar/MonthCalendar';
+import { Statistics } from '../features/calendar/Statistics';
+import { DataPanel } from '../features/calendar/DataPanel';
+import { NotificationSettings } from '../features/calendar/NotificationSettings';
+import { AccountPanel } from '../features/account/AccountPanel';
+import { api } from '../services/api';
+import { createInitialState } from '../services/storage';
 
 interface EventDraft {
   id?: string;
@@ -20,6 +28,11 @@ interface EventDraft {
   recoveryMinutes: number;
   transportWon: number;
   mealWon: number;
+  endDate: string;
+  allDay: boolean;
+  frequency: 'none' | 'daily' | 'weekly' | 'monthly';
+  interval: number;
+  until: string;
 }
 
 function todayInKorea() {
@@ -69,6 +82,11 @@ function draftFromEvent(event: CalendarEvent | undefined, eventTypes: EventType[
       recoveryMinutes: event.shadow.recoveryMinutes,
       transportWon: event.cost.transportWon,
       mealWon: event.cost.mealWon,
+      endDate: event.endDate ?? event.date,
+      allDay: event.allDay ?? false,
+      frequency: event.recurrence?.frequency ?? 'none',
+      interval: event.recurrence?.interval ?? 1,
+      until: event.recurrence?.until ?? addDays(event.date, 90),
     };
   }
   const defaults = defaultsFromType(fallback);
@@ -80,6 +98,11 @@ function draftFromEvent(event: CalendarEvent | undefined, eventTypes: EventType[
     date,
     startMinute: 15 * 60,
     endMinute: 16 * 60,
+    endDate: date,
+    allDay: false,
+    frequency: 'none',
+    interval: 1,
+    until: addDays(date, 90),
     ...defaults,
   };
 }
@@ -92,8 +115,14 @@ function eventFromDraft(draft: EventDraft, existing?: CalendarEvent): CalendarEv
     typeId: draft.typeId,
     location: draft.location.trim() || undefined,
     date: draft.date,
-    startMinute: draft.startMinute,
-    endMinute: draft.endMinute,
+    endDate: draft.endDate === draft.date ? undefined : draft.endDate,
+    allDay: draft.allDay || undefined,
+    startMinute: draft.allDay ? 0 : draft.startMinute,
+    endMinute: draft.allDay ? 1440 : draft.endMinute,
+    recurrence: draft.frequency === 'none' ? undefined : { frequency: draft.frequency, interval: draft.interval, until: draft.until },
+    excludedDates: draft.frequency === 'none' ? undefined : existing?.excludedDates?.filter((date) => date >= draft.date && date <= draft.until),
+    sourceId: existing?.sourceId,
+    occurrenceDate: existing?.occurrenceDate,
     shadow: {
       preparationMinutes: draft.preparationMinutes,
       outboundTravelMinutes: draft.outboundTravelMinutes,
@@ -112,20 +141,46 @@ function getConflictMessage(conflict: Conflict, events: CalendarEvent[]) {
 }
 
 export function App() {
-  const { state, storageError, storageBlocked, retrySave, resetData } = useApp();
+  const { state: localState, storageError, storageBlocked, retrySave, resetData, undo, redo, canUndo, canRedo } = useApp();
   const isNarrow = useIsNarrow();
   const initialDate = todayInKorea();
   const [selectedDate, setSelectedDate] = useState(initialDate);
   const [eventPanel, setEventPanel] = useState<{ event?: CalendarEvent; date: string } | null>(null);
   const [showTypes, setShowTypes] = useState(false);
+  const [showData, setShowData] = useState(false);
+  const [showAccount, setShowAccount] = useState(() => new URLSearchParams(window.location.search).get('integration') === 'connected');
+  const [showStats, setShowStats] = useState(false);
+  const [view, setView] = useState<'day' | 'week' | 'month'>(isNarrow ? 'day' : 'week');
+  const [query, setQuery] = useState('');
+  const [typeFilter, setTypeFilter] = useState('');
+  const [shared, setShared] = useState<{ title: string; state: AppState }>();
+  const [shareError, setShareError] = useState('');
+  const [shareToken] = useState(() => new URLSearchParams(window.location.hash.slice(1)).get('share'));
+  const state = shared?.state ?? (shareToken ? createInitialState() : localState);
+  const readOnly = !!shareToken;
+  useEffect(() => {
+    if (!shareToken) return;
+    void api<{ title: string; state: AppState }>(`/api/public/${encodeURIComponent(shareToken)}`).then((result) => {
+      if (!isAppState(result.state)) throw new Error('공유 캘린더를 읽지 못했습니다.');
+      setShared(result);
+      if (result.state.events[0]) setSelectedDate(result.state.events[0].date);
+    }).catch((cause: Error) => setShareError(cause.message));
+  }, [shareToken]);
   const weekDays = useMemo(() => Array.from({ length: 7 }, (_, index) => addDays(startOfWeek(selectedDate), index)), [selectedDate]);
-  const visibleDays = isNarrow ? [selectedDate] : weekDays;
+  const visibleDays = useMemo(() => view === 'month' ? monthDates(selectedDate) : isNarrow || view === 'day' ? [selectedDate] : weekDays, [view, selectedDate, isNarrow, weekDays]);
+  const expansion = useMemo(() => {
+    try { return { events: readOnly && !shared ? [] : expandEvents(state.events, visibleDays[0], visibleDays.at(-1)!), error: '' }; }
+    catch (cause) { return { events: [], error: cause instanceof Error ? cause.message : '일정을 표시하지 못했습니다.' }; }
+  }, [state.events, visibleDays, readOnly, shared]);
+  const expanded = expansion.events;
+  const filtered = useMemo(() => expanded.filter((event) => (!typeFilter || event.typeId === typeFilter) && `${event.title} ${event.location ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())), [expanded, query, typeFilter]);
+  const selectEvent = (event: CalendarEvent) => { if (!readOnly && !storageBlocked) setEventPanel({ event, date: event.date }); };
 
   const goPrevious = () => {
-    setSelectedDate((date) => addDays(date, isNarrow ? -1 : -7));
+    setSelectedDate((date) => view === 'month' ? shiftMonth(date, -1) : addDays(date, isNarrow || view === 'day' ? -1 : -7));
   };
   const goNext = () => {
-    setSelectedDate((date) => addDays(date, isNarrow ? 1 : 7));
+    setSelectedDate((date) => view === 'month' ? shiftMonth(date, 1) : addDays(date, isNarrow || view === 'day' ? 1 : 7));
   };
   const goToday = () => {
     const today = todayInKorea();
@@ -144,12 +199,17 @@ export function App() {
           </div>
         </div>
         <div className="topbar-actions">
-          <button className="button ghost" onClick={() => setShowTypes(true)}>일정 유형</button>
-          <button className="button primary" disabled={storageBlocked} onClick={() => setEventPanel({ date: selectedDate })}>+ 새 일정</button>
+          {!readOnly && <>
+            <button className="button ghost" onClick={() => setShowAccount(true)}>계정·연동</button>
+            <button className="button ghost" onClick={() => setShowData(true)}>백업·ICS</button>
+            <button className="button ghost" onClick={() => setShowTypes(true)}>일정 유형</button>
+            <button className="button primary" disabled={storageBlocked} onClick={() => setEventPanel({ date: selectedDate })}>+ 새 일정</button>
+          </>}
         </div>
       </header>
 
-      {storageError && (
+      {shareToken && <div className="notice warning" role="status">{shared ? `${shared.title} · 읽기 전용 공유본` : shareError || '공유 캘린더를 불러오는 중…'} <a href="/">내 캘린더로 돌아가기</a></div>}
+      {storageError && !readOnly && (
         <div className="notice warning" role="alert">
           <span>{storageError}</span>
           {storageBlocked ? <button className="button danger" onClick={() => { if (window.confirm('보존 중인 저장 데이터를 지우고 초기화할까요? 이 작업은 되돌릴 수 없습니다.')) resetData(); }}>데이터 초기화</button> : <button className="button ghost" onClick={retrySave}>저장 재시도</button>}
@@ -170,31 +230,44 @@ export function App() {
       </section>
 
       <section id="calendar" tabIndex={-1} className="calendar-card" aria-label="SHADOW 캘린더">
+        {expansion.error && <p className="notice warning" role="alert">{expansion.error}</p>}
+        <div className="calendar-controls">
+          <label>보기<select value={view} onChange={(event) => setView(event.target.value as typeof view)}><option value="day">일간</option><option value="week">주간</option><option value="month">월간</option></select></label>
+          <label>일정 검색<input type="search" placeholder="제목 또는 장소…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+          <label>유형 필터<select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="">전체 유형</option>{state.eventTypes.map((type) => <option key={type.id} value={type.id}>{type.name}</option>)}</select></label>
+          <button className="button ghost" aria-pressed={showStats} onClick={() => setShowStats(!showStats)}>통계</button>
+          {!readOnly && <><button className="button ghost" disabled={!canUndo} onClick={undo}>실행 취소</button><button className="button ghost" disabled={!canRedo} onClick={redo}>다시 실행</button></>}
+        </div>
         <div className="calendar-toolbar">
           <div className="date-navigation">
-            <button className="icon-button" onClick={goPrevious} aria-label={isNarrow ? '이전 날짜' : '이전 주'}>←</button>
+            <button className="icon-button" onClick={goPrevious} aria-label={view === 'month' ? '이전 달' : isNarrow || view === 'day' ? '이전 날짜' : '이전 주'}>←</button>
             <button className="today-button" onClick={goToday}>오늘</button>
-            <button className="icon-button" onClick={goNext} aria-label={isNarrow ? '다음 날짜' : '다음 주'}>→</button>
-            <strong>{isNarrow ? formatDateLabel(selectedDate) : `${formatDateLabel(weekDays[0], true)} — ${formatDateLabel(weekDays[6], true)}`}</strong>
+            <button className="icon-button" onClick={goNext} aria-label={view === 'month' ? '다음 달' : isNarrow || view === 'day' ? '다음 날짜' : '다음 주'}>→</button>
+            <strong>{view === 'month' ? selectedDate.slice(0, 7) : isNarrow || view === 'day' ? formatDateLabel(selectedDate) : `${formatDateLabel(weekDays[0], true)} — ${formatDateLabel(weekDays[6], true)}`}</strong>
           </div>
-          <span className="local-note">{storageError ? '저장 상태를 확인해 주세요.' : '모든 데이터는 이 브라우저에만 저장됩니다.'}</span>
+          <span className="local-note">{readOnly ? '공유된 복사본' : storageError ? '저장 상태를 확인해 주세요.' : '브라우저에 저장 · 계정 메뉴에서 서버 동기화'}</span>
         </div>
-        <Calendar
+        {showStats && <Statistics days={visibleDays} events={filtered} types={state.eventTypes} />}
+        {view === 'month' ? <MonthCalendar date={selectedDate} events={filtered} eventTypes={state.eventTypes} readOnly={readOnly} onSelect={selectEvent} onDay={(date) => { setSelectedDate(date); setView('day'); }} /> : <Calendar
           days={visibleDays}
-          events={state.events}
+          events={readOnly && !shared ? [] : filtered}
+          readOnly={readOnly}
           eventTypes={state.eventTypes}
-          onSelect={(event) => { if (!storageBlocked) setEventPanel({ event, date: event.date }); }}
-          onCreate={(date) => { if (!storageBlocked) setEventPanel({ date }); }}
-        />
+          onSelect={selectEvent}
+          onCreate={(date) => { if (!readOnly && !storageBlocked) setEventPanel({ date }); }}
+        />}
       </section>
 
       <footer className="privacy-note">
-        <span>개인 일정은 외부로 전송되지 않습니다.</span>
-        <span>공유 기기에서는 브라우저 데이터가 노출될 수 있습니다.</span>
+        <span>기본은 로컬 저장이며 서버·외부 동기화와 공유는 직접 선택할 때 실행됩니다.</span>
+        <span>공유 기기에서는 로그아웃 후 로컬 데이터도 확인해 주세요.</span>
       </footer>
 
       {eventPanel && <EventPanel initialEvent={eventPanel.event} date={eventPanel.date} onSaved={setSelectedDate} onClose={() => setEventPanel(null)} />}
       {showTypes && <EventTypesPanel onClose={() => setShowTypes(false)} />}
+      {showData && <DataPanel onClose={() => setShowData(false)} />}
+      {showAccount && <AccountPanel onClose={() => setShowAccount(false)} />}
+      {!readOnly && <NotificationSettings events={state.events} />}
     </main>
   );
 }
@@ -216,12 +289,20 @@ function firstInvalidField(form: HTMLFormElement): FormError | undefined {
 
 function EventPanel({ initialEvent, date, onSaved, onClose }: { initialEvent?: CalendarEvent; date: string; onSaved: (date: string) => void; onClose: () => void }) {
   const { state, dispatch } = useApp();
+  const [editingEvent, setEditingEvent] = useState(initialEvent);
   const [draft, setDraft] = useState(() => draftFromEvent(initialEvent, state.eventTypes, date));
   const [error, setError] = useState<FormError>();
-  const candidate = eventFromDraft(draft, initialEvent);
+  const candidate = eventFromDraft(draft, editingEvent);
   const validationError = getEventValidationError(candidate, state.eventTypes);
   const summary = validationError ? undefined : summarizeEvent(candidate);
-  const conflicts = validationError ? [] : detectConflicts(candidate, state.events);
+  let surroundingEvents: CalendarEvent[] = [];
+  let conflictError = '';
+  if (!validationError) {
+    try { surroundingEvents = expandEvents(state.events.filter((event) => event.id !== candidate.id), addDays(candidate.date, -2), addDays(candidate.endDate ?? candidate.date, 2)); }
+    catch (cause) { conflictError = cause instanceof Error ? cause.message : '충돌을 계산하지 못했습니다.'; }
+  }
+  const conflicts = validationError ? [] : detectConflicts(candidate, surroundingEvents);
+  const series = initialEvent?.sourceId ? state.events.find((event) => event.id === initialEvent.sourceId) : undefined;
   const fieldError = (field: string) => ({
     'aria-invalid': error?.field === field || undefined,
     'aria-describedby': error?.field === field ? 'event-form-error' : undefined,
@@ -249,7 +330,7 @@ function EventPanel({ initialEvent, date, onSaved, onClose }: { initialEvent?: C
     }
   };
   const remove = () => {
-    if (initialEvent && window.confirm(`“${initialEvent.title}” 일정을 삭제할까요?`) && dispatch({ type: 'event/delete', id: initialEvent.id })) onClose();
+    if (editingEvent && window.confirm(`“${editingEvent.title}” ${editingEvent.recurrence ? '전체 반복' : '선택한'} 일정을 삭제할까요?`) && dispatch({ type: 'event/delete', id: editingEvent.id, sourceId: editingEvent.sourceId, occurrenceDate: editingEvent.occurrenceDate, updatedAt: new Date().toISOString() })) onClose();
   };
 
   return <SidePanel titleId="event-panel-title" onClose={onClose}>
@@ -258,15 +339,19 @@ function EventPanel({ initialEvent, date, onSaved, onClose }: { initialEvent?: C
       <button className="icon-button" onClick={onClose} aria-label="일정 패널 닫기">×</button>
     </div>
     <form noValidate autoComplete="off" onSubmit={submit} onChange={() => setError(undefined)} className="event-form">
+      {series && <label>반복 일정 변경 범위<select aria-label="반복 일정 변경 범위" value={editingEvent?.sourceId ? 'occurrence' : 'series'} onChange={(event) => { const next = event.target.value === 'series' ? series : initialEvent; setEditingEvent(next); setDraft(draftFromEvent(next, state.eventTypes, date)); }}><option value="occurrence">이번 일정만</option><option value="series">전체 반복 일정</option></select></label>}
       <label>일정 제목<input name="title" required {...fieldError('title')} value={draft.title} maxLength={80} onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))} placeholder="예: 병원 진료…" /></label>
       <label>일정 유형<select name="typeId" value={draft.typeId} onChange={(event) => setType(event.target.value)}>{state.eventTypes.map((type) => <option key={type.id} value={type.id}>{type.name}</option>)}</select></label>
       <label>장소 <span className="optional">선택</span><input name="location" maxLength={200} value={draft.location} onChange={(event) => setDraft((current) => ({ ...current, location: event.target.value }))} placeholder="예: 강남세브란스…" /></label>
       <div className="field-row">
-        <label>날짜<input name="date" required type="date" min="1900-01-01" max="9999-12-31" {...fieldError('date')} value={draft.date} onChange={(event) => setDraft((current) => ({ ...current, date: event.target.value }))} /></label>
-        <label>시작<input name="startMinute" required type="time" step="60" {...fieldError('startMinute')} value={Number.isFinite(draft.startMinute) ? toTimeInput(draft.startMinute) : ''} onChange={(event) => setDraft((current) => ({ ...current, startMinute: fromTimeInput(event.target.value) }))} /></label>
-        <label>종료<input name="endMinute" required type="time" step="60" disabled={draft.endMinute === 1440} {...fieldError('endMinute')} value={draft.endMinute === 1440 ? '00:00' : Number.isFinite(draft.endMinute) ? toTimeInput(draft.endMinute) : ''} onChange={(event) => setDraft((current) => ({ ...current, endMinute: fromTimeInput(event.target.value) }))} /></label>
+        <label>날짜<input name="date" required type="date" min="1900-01-01" max="9999-12-31" {...fieldError('date')} value={draft.date} onChange={(event) => setDraft((current) => ({ ...current, date: event.target.value, endDate: current.endDate === current.date ? event.target.value : current.endDate }))} /></label>
+        <label>시작<input name="startMinute" required type="time" step="60" disabled={draft.allDay} {...fieldError('startMinute')} value={Number.isFinite(draft.startMinute) ? toTimeInput(draft.startMinute) : ''} onChange={(event) => setDraft((current) => ({ ...current, startMinute: fromTimeInput(event.target.value) }))} /></label>
+        <label>종료<input name="endMinute" required type="time" step="60" disabled={draft.allDay || draft.endMinute === 1440} {...fieldError('endMinute')} value={draft.endMinute === 1440 ? '00:00' : Number.isFinite(draft.endMinute) ? toTimeInput(draft.endMinute) : ''} onChange={(event) => setDraft((current) => ({ ...current, endMinute: fromTimeInput(event.target.value) }))} /></label>
       </div>
-      <label className="checkbox-label"><input type="checkbox" checked={draft.endMinute === 1440} onChange={(event) => setDraft((current) => ({ ...current, endMinute: event.target.checked ? 1440 : Math.min(current.startMinute + 60, 1439) }))} />자정에 종료 (24:00)</label>
+      <label>종료 날짜<input name="endDate" required type="date" min={draft.date} max="9999-12-31" value={draft.endDate} {...fieldError('endDate')} onChange={(event) => setDraft((current) => ({ ...current, endDate: event.target.value }))} /></label>
+      <label className="checkbox-label"><input type="checkbox" checked={draft.allDay} onChange={(event) => setDraft((current) => ({ ...current, allDay: event.target.checked }))} />종일 일정</label>
+      {!draft.allDay && <label className="checkbox-label"><input type="checkbox" checked={draft.endMinute === 1440} onChange={(event) => setDraft((current) => ({ ...current, endMinute: event.target.checked ? 1440 : Math.min(current.startMinute + 60, 1439) }))} />자정에 종료 (24:00)</label>}
+      {!editingEvent?.sourceId && <fieldset><legend>반복</legend><label>반복 주기<select value={draft.frequency} onChange={(event) => setDraft((current) => ({ ...current, frequency: event.target.value as EventDraft['frequency'] }))}><option value="none">반복 안 함</option><option value="daily">매일</option><option value="weekly">매주</option><option value="monthly">매월</option></select></label>{draft.frequency !== 'none' && <div className="field-row"><label>반복 간격<input name="interval" type="number" required min="1" max="365" value={Number.isFinite(draft.interval) ? draft.interval : ''} onChange={(event) => setNumber('interval', event.target.value)} {...fieldError('interval')} /></label><label>반복 종료일<input name="until" type="date" required min={draft.date} max={addDays(draft.date || date, 1830)} value={draft.until} onChange={(event) => setDraft((current) => ({ ...current, until: event.target.value }))} {...fieldError('until')} /></label></div>}<small>월 반복은 같은 날짜에 생성되며 해당 날짜가 없는 달은 건너뜁니다.</small></fieldset>}
       <fieldset><legend>시간의 그림자</legend><div className="field-grid">
         {([
           ['preparationMinutes', '준비'], ['outboundTravelMinutes', '출발 이동'],
@@ -278,7 +363,8 @@ function EventPanel({ initialEvent, date, onSaved, onClose }: { initialEvent?: C
         <NumberField name="mealWon" label="식비" value={draft.mealWon} onChange={(value) => setNumber('mealWon', value)} unit="원" error={error?.field === 'mealWon' ? 'event-form-error' : undefined} />
       </div></fieldset>
       {summary ? <div className="actual-price"><span>이 약속의 실제 가격</span><strong>시간 {formatMinutes(summary.totalMinutes)} <i aria-hidden="true" /> {formatWon(summary.totalCostWon)}</strong><small>일정 {formatMinutes(summary.coreMinutes)} + 그림자 {formatMinutes(summary.shadowMinutes)}</small></div> : <p className="panel-description">제목과 올바른 시간을 입력하면 실제 시간과 비용이 표시됩니다.</p>}
-      {conflicts.length > 0 && <div className="form-conflicts" role="status"><strong>이 일정의 그림자가 겹칩니다.</strong>{conflicts.map((conflict, index) => <span key={index}>{getConflictMessage(conflict, state.events)}</span>)}</div>}
+      {conflicts.length > 0 && <div className="form-conflicts" role="status"><strong>이 일정의 그림자가 겹칩니다.</strong>{conflicts.map((conflict, index) => <span key={index}>{getConflictMessage(conflict, surroundingEvents)}</span>)}</div>}
+      {conflictError && <p className="form-error" role="status">충돌 미리보기: {conflictError} 일정 저장은 가능합니다.</p>}
       {error && <p id="event-form-error" className="form-error" role="alert">{error.message}</p>}
       <div className="form-actions">{initialEvent && <button type="button" className="button danger" onClick={remove}>삭제</button>}<span /><button type="button" className="button ghost" onClick={onClose}>취소</button><button type="submit" className="button primary">{initialEvent ? '변경 저장' : '일정 만들기'}</button></div>
     </form>

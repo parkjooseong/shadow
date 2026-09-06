@@ -5,12 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:full": "node --env-file-if-exists=.env scripts/dev.mjs",
+    "server": "node --env-file-if-exists=.env server/index.mjs",
+    "start": "node --env-file-if-exists=.env server/index.mjs",
+    "test:server": "node --test server/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "typecheck": "tsc -b --pretty false",
     "test": "vitest",
     "test:e2e": "playwright test",
-    "verify": "npm run lint && npm run typecheck && npm run test -- --run && npm run build"
+    "verify": "npm run lint && npm run typecheck && npm run test -- --run && npm run test:server && npm run build"
   },
   "dependencies": {
     "react": "^19.1.1",

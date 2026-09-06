@@ -17,6 +17,16 @@ export interface CalendarEvent {
   typeId: string;
   location?: string;
   date: string;
+  endDate?: string;
+  allDay?: boolean;
+  recurrence?: {
+    frequency: 'daily' | 'weekly' | 'monthly';
+    interval: number;
+    until: string;
+  };
+  excludedDates?: string[];
+  sourceId?: string;
+  occurrenceDate?: string;
   startMinute: number;
   endMinute: number;
   shadow: {

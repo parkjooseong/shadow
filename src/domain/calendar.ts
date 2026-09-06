@@ -34,9 +34,15 @@ export function formatTime(minute: number): string {
   return `${String(Math.floor(normalized / 60)).padStart(2, '0')}:${String(normalized % 60).padStart(2, '0')}`;
 }
 
+export function eventCoreRange(event: CalendarEvent): { start: number; end: number } {
+  return {
+    start: toAbsoluteMinute(event.date, event.allDay ? 0 : event.startMinute),
+    end: toAbsoluteMinute(event.endDate ?? event.date, event.allDay ? DAY_MINUTES : event.endMinute),
+  };
+}
+
 export function getFootprint(event: CalendarEvent): FootprintSegment[] {
-  const start = toAbsoluteMinute(event.date, event.startMinute);
-  const end = toAbsoluteMinute(event.date, event.endMinute);
+  const { start, end } = eventCoreRange(event);
   const prepStart = start - event.shadow.outboundTravelMinutes - event.shadow.preparationMinutes;
   const outboundStart = start - event.shadow.outboundTravelMinutes;
   const returnEnd = end + event.shadow.returnTravelMinutes;
@@ -52,7 +58,8 @@ export function getFootprint(event: CalendarEvent): FootprintSegment[] {
 }
 
 export function summarizeEvent(event: CalendarEvent): EventSummary {
-  const coreMinutes = event.endMinute - event.startMinute;
+  const { start, end } = eventCoreRange(event);
+  const coreMinutes = end - start;
   const shadowMinutes =
     event.shadow.preparationMinutes +
     event.shadow.outboundTravelMinutes +

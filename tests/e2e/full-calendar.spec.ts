@@ -1,0 +1,157 @@
+import { expect, test, type Page } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+
+test.beforeEach(async ({ page }) => { await page.clock.setFixedTime(new Date('2026-09-07T00:00:00Z')); });
+
+async function draft(page: Page, title: string) {
+  await page.getByRole('button', { name: '+ 새 일정', exact: true }).click();
+  await page.getByLabel('일정 제목').fill(title);
+  await page.getByLabel('날짜', { exact: true }).fill('2026-09-07');
+  await page.getByLabel('일정 유형').selectOption('online');
+}
+
+test('recurrence, scoped edit/delete, history, search, month and statistics persist', async ({ page }) => {
+  await page.goto('/');
+  await draft(page, '매일 공부');
+  await page.getByLabel('반복 주기').selectOption('daily');
+  await page.getByLabel('반복 종료일').fill('2026-09-09');
+  await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
+  await expect(page.locator('.event-block')).toHaveCount(3);
+  await page.locator('.event-block').nth(1).click();
+  await expect(page.getByLabel('반복 일정 변경 범위')).toHaveValue('occurrence');
+  await page.getByLabel('일정 제목').fill('이번만 변경');
+  await page.getByRole('button', { name: '변경 저장' }).click();
+  await expect(page.locator('.event-block').filter({ hasText: '매일 공부' })).toHaveCount(2);
+  await page.getByRole('button', { name: '실행 취소', exact: true }).click();
+  await expect(page.locator('.event-block').filter({ hasText: '매일 공부' })).toHaveCount(3);
+  await page.getByRole('button', { name: '다시 실행', exact: true }).click();
+  await page.getByLabel('일정 검색').fill('이번만');
+  await expect(page.locator('.event-block')).toHaveCount(1);
+  await page.getByLabel('일정 검색').clear();
+  await page.getByLabel('보기').selectOption('month');
+  await expect(page.locator('.month-day')).toHaveCount(42);
+  await expect(page.locator('.month-event')).toHaveCount(3);
+  await page.getByRole('button', { name: '통계', exact: true }).click();
+  await expect(page.getByRole('region', { name: '시간과 비용 통계' })).toContainText('3시간');
+  const a11y = await new AxeBuilder({ page }).analyze();
+  expect(a11y.violations).toEqual([]);
+  await page.reload();
+  await page.getByLabel('보기').selectOption('month');
+  await expect(page.locator('.month-event')).toHaveCount(3);
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('shadow.appState.v1')!).events.length)).toBe(2);
+  await page.locator('.month-event').filter({ hasText: '매일 공부' }).first().click();
+  await page.getByLabel('반복 일정 변경 범위').selectOption('series');
+  await page.getByLabel('일정 제목').fill('전체 변경');
+  await page.getByRole('button', { name: '변경 저장' }).click();
+  await expect(page.locator('.month-event').filter({ hasText: '전체 변경' })).toHaveCount(2);
+  await expect(page.locator('.month-event').filter({ hasText: '이번만 변경' })).toHaveCount(1);
+});
+
+test('all-day and overnight spans, filtered view and occurrence deletion', async ({ page }) => {
+  await page.goto('/');
+  await draft(page, '이틀 여행');
+  await page.getByLabel('종일 일정').check();
+  await page.getByLabel('종료 날짜', { exact: true }).fill('2026-09-08');
+  await expect(page.locator('.actual-price')).toContainText('48시간');
+  await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
+  await expect(page.locator('.event-block')).toHaveCount(2);
+  await draft(page, '야간 작업');
+  await page.getByLabel('시작', { exact: true }).fill('23:00');
+  await page.getByLabel('종료', { exact: true }).fill('01:00');
+  await page.getByLabel('종료 날짜', { exact: true }).fill('2026-09-08');
+  await expect(page.locator('.actual-price')).toContainText('일정 2시간');
+  await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
+  await page.getByLabel('유형 필터').selectOption('hospital');
+  await expect(page.locator('.event-block')).toHaveCount(0);
+  await page.getByLabel('유형 필터').selectOption('');
+  await expect(page.locator('.event-block')).toHaveCount(4);
+  await draft(page, '삭제할 반복');
+  await page.getByLabel('반복 주기').selectOption('daily');
+  await page.getByLabel('반복 종료일').fill('2026-09-08');
+  await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
+  await page.locator('.event-block').filter({ hasText: '삭제할 반복' }).first().click();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '삭제', exact: true }).click();
+  await expect(page.locator('.event-block').filter({ hasText: '삭제할 반복' })).toHaveCount(1);
+});
+
+test('JSON and ICS download, restore, import and malformed data preservation', async ({ page }) => {
+  await page.goto('/');
+  await draft(page, '백업 일정');
+  await page.getByLabel('교통비').fill('4000');
+  await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
+  const original = await page.evaluate(() => localStorage.getItem('shadow.appState.v1')!);
+  await page.getByRole('button', { name: '백업·ICS' }).click();
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'JSON 백업 다운로드' }).click();
+  expect((await download).suggestedFilename()).toBe('shadow-backup.json');
+  await page.getByLabel('JSON 백업 복원').setInputFiles({ name: 'broken.json', mimeType: 'application/json', buffer: Buffer.from('{broken') });
+  await expect(page.getByRole('alert')).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('shadow.appState.v1'))).toBe(original);
+  const json = JSON.parse(original); json.events[0].title = '복원 완료';
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByLabel('JSON 백업 복원').setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(json)) });
+  await expect(page.getByText('백업을 복원했습니다.')).toBeVisible();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByLabel('ICS 가져오기').setInputFiles({ name: 'external.ics', mimeType: 'text/calendar', buffer: Buffer.from('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:external-1\r\nDTSTART:20260907T090000\r\nDTEND:20260907T100000\r\nSUMMARY:외부 약속\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n') });
+  await expect(page.getByRole('status').filter({ hasText: '1개를 가져왔습니다' })).toBeVisible();
+  await page.getByRole('button', { name: '백업 패널 닫기' }).click();
+  await expect(page.locator('.event-block').filter({ hasText: '복원 완료' })).toHaveCount(1);
+  await expect(page.locator('.event-block').filter({ hasText: '외부 약속' })).toHaveCount(1);
+});
+
+test('account, cloud roundtrip, public read-only share and revoke use the real server', async ({ page, browser }) => {
+  await page.goto('/');
+  await draft(page, '서버에 보관');
+  await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
+  await page.getByRole('button', { name: '계정·연동' }).click();
+  await page.getByRole('button', { name: '회원가입으로 전환', exact: true }).click();
+  await page.getByLabel('이름', { exact: true }).fill('Calendar Tester');
+  await page.getByLabel('이메일', { exact: true }).fill(`calendar-${crypto.randomUUID()}@example.test`);
+  await page.getByLabel(/비밀번호/).fill('Long-password-123!');
+  await page.getByRole('button', { name: '계정 만들기', exact: true }).click();
+  await page.getByRole('button', { name: '이 브라우저 데이터를 서버에 저장', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: '서버에 저장했습니다' })).toBeVisible();
+  await page.getByRole('button', { name: '계정 패널 닫기' }).click();
+  await page.locator('.event-block').filter({ hasText: '서버에 보관' }).click();
+  await page.getByLabel('일정 제목').fill('로컬에서만 변경');
+  await page.getByRole('button', { name: '변경 저장' }).click();
+  await page.getByRole('button', { name: '계정·연동' }).click();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '서버 데이터 가져오기' }).click();
+  await expect(page.getByText('서버 캘린더를 가져왔습니다.')).toBeVisible();
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('shadow.appState.v1')!).events[0].title)).toBe('서버에 보관');
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: /공유 링크 만들기/ }).click();
+  const share = page.locator('a[href*="#share="]').first();
+  await expect(share).toBeVisible();
+  const publicPage = await browser.newPage();
+  await publicPage.goto(new URL((await share.getAttribute('href'))!, page.url()).href);
+  await expect(publicPage.getByRole('status')).toContainText('읽기 전용 공유본');
+  await expect(publicPage.locator('.event-block').filter({ hasText: '서버에 보관' })).toHaveCount(1);
+  await expect(publicPage.getByRole('button', { name: '+ 새 일정' })).toHaveCount(0);
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: '폐기', exact: true }).first().click();
+  await publicPage.reload();
+  await expect(publicPage.getByRole('status')).not.toContainText('읽기 전용 공유본');
+  await publicPage.close();
+});
+
+test('expanded controls and account/data panels remain accessible on mobile', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await draft(page, '모바일 일정');
+  await page.getByLabel('종일 일정').check();
+  await page.getByRole('button', { name: '일정 만들기', exact: true }).click();
+  await page.getByLabel('보기').selectOption('month');
+  await page.getByRole('button', { name: '통계', exact: true }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath('expanded-mobile.png'), fullPage: true });
+  await page.getByRole('button', { name: '백업·ICS' }).click();
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '계정·연동' }).click();
+  await expect(page.getByRole('button', { name: '로그인', exact: true })).toBeEnabled();
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+});

@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CalendarEvent } from '../domain/types';
 import { createInitialState, STORAGE_KEY } from '../services/storage';
 import { AppProvider, reducer, useApp } from './AppContext';
+import { expandEvents } from '../domain/recurrence';
+import { isAppState } from '../domain/validation';
 
 const event: CalendarEvent = {
   id: 'event-1', title: '병원', typeId: 'hospital', date: '2026-09-07', startMinute: 900, endMinute: 960,
@@ -12,7 +14,7 @@ const event: CalendarEvent = {
 };
 
 function Probe() {
-  const { state, dispatch, resetData, storageError, storageBlocked, clearStorageError, retrySave } = useApp();
+  const { state, dispatch, resetData, storageError, storageBlocked, clearStorageError, retrySave, undo, redo, canUndo, canRedo } = useApp();
   return <>
     <output aria-label="event count">{state.events.length}</output>
     <output aria-label="blocked">{String(storageBlocked)}</output>
@@ -23,6 +25,8 @@ function Probe() {
     <button onClick={resetData}>Reset</button>
     <button onClick={clearStorageError}>Dismiss</button>
     <button onClick={retrySave}>Retry</button>
+    <button disabled={!canUndo} onClick={undo}>Undo</button>
+    <button disabled={!canRedo} onClick={redo}>Redo</button>
   </>;
 }
 
@@ -86,6 +90,37 @@ describe('provider storage recovery', () => {
 });
 
 describe('reducer invariants', () => {
+  it('atomically detaches one occurrence, persists linkage and deletes the full series safely', () => {
+    const master: CalendarEvent = { ...event, recurrence: { frequency: 'daily', interval: 1, until: '2026-09-09' } };
+    const state = { ...createInitialState(), events: [master] };
+    const occurrence = expandEvents([master], '2026-09-08', '2026-09-08')[0];
+    const changed = reducer(state, { type: 'event/save', event: { ...occurrence, title: 'Changed occurrence' } });
+    expect(isAppState(changed)).toBe(true);
+    expect(changed.events[0].excludedDates).toEqual(['2026-09-08']);
+    expect(expandEvents(changed.events, '2026-09-07', '2026-09-09')).toHaveLength(3);
+    const deleted = reducer(changed, { type: 'event/delete', id: occurrence.id, sourceId: master.id, occurrenceDate: '2026-09-08' });
+    expect(isAppState(deleted)).toBe(true);
+    expect(expandEvents(deleted.events, '2026-09-07', '2026-09-09')).toHaveLength(2);
+    expect(reducer(changed, { type: 'event/delete', id: master.id }).events).toEqual([]);
+    const standalone = reducer(changed, { type: 'event/save', event: { ...master, recurrence: undefined, excludedDates: undefined } });
+    expect(isAppState(standalone)).toBe(true);
+    expect(standalone.events[1].sourceId).toBeUndefined();
+  });
+
+  it('persists undo/redo, clears redo after new edits and clears history on reset', () => {
+    render(<AppProvider><Probe /></AppProvider>);
+    expect(screen.getByText('Undo')).toBeDisabled();
+    fireEvent.click(screen.getByText('Save event'));
+    fireEvent.click(screen.getByText('Undo'));
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).events).toEqual([]);
+    fireEvent.click(screen.getByText('Redo'));
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!).events).toHaveLength(1);
+    fireEvent.click(screen.getByText('Undo'));
+    fireEvent.click(screen.getByText('Save event'));
+    expect(screen.getByText('Redo')).toBeDisabled();
+    fireEvent.click(screen.getByText('Reset'));
+    expect(screen.getByText('Undo')).toBeDisabled();
+  });
   it('never deletes the last type or a type referenced by events', () => {
     const state = createInitialState();
     state.eventTypes = [state.eventTypes[1]];
